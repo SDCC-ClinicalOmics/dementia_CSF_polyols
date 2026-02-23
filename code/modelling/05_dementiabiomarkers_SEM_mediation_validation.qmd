@@ -1,0 +1,1265 @@
+---
+title: 'Mediation analysis (SEM) validation in an external cohort and genetics evaluation'
+author: 
+    - name: 'Marc Clos-Garcia'
+      affiliation: 'Steno Diabetes Center Copenhagen, Denmark'
+      email: 'marc.clos.garcia@regiong.dk'
+date: last-modified
+date-format: "D MMMM, YYYY"
+format: 
+    html:
+        toc: true
+        toc-depth: 3
+        number-sections: true
+        code-fold: true
+        code-summary: 'Click to expand/collapse code'
+        theme: cosmo
+---
+
+In this report, we check how well our SEM models perform in an external cohort, with the limitation of limited overlapping in our metabolites of interest. Furthermore, we also test in this external cohort a set of SNPs of interest reported to be associated to our metabolites.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+## libraries
+library(here)
+library(tidyverse)
+library(ggplot2)
+
+## directories
+dir_cohort <- here("data/ExternalCohorts/CruchagaLab_CSF_metabolomics")
+dir_genetics <- here("results/ADNI_genetics")
+dir_discovery <- here("results/modelling")
+
+## functions
+# Format Estimates and CIs
+format_result <- function(estimate, ci_lower, ci_upper) {
+  if (is.na(ci_lower)) { # For Proportion/Ratio rows
+    return(sprintf("%.3f", estimate))
+  }
+  return(sprintf("%.3f [%.3f, %.3f]", estimate, ci_lower, ci_upper))
+}
+```
+
+```{r utilities}
+feature_labels <- data.frame(
+  "current_names" = c("arabitol.xylitol", "threonate", "ribonate", "glucose", "gluc.ery", "mannitol.sorbitol"),
+  "plotting_names" = c("Arabitol/Xylitol", "Threonate", "Ribonate", "Glucose", "Glucose/Erythritol ratio", "Mannitol/Sorbitol")
+)
+```
+
+```{r}
+## load data
+dx <- read.table(file.path(dir_cohort, "DXSUM_24Dec2025.csv"), sep = ",", header = T)
+metadata <- read.table(file.path(dir_cohort, "ADNI_SelectedVars.csv"), sep = ",", header = T)
+metadata <- metadata |>
+  dplyr::filter(!is.na(TAU), !is.na(PTAU), !is.na(ABETA42))
+
+dx <- dx[, c("PTID", "RID")]
+metadata <- metadata |>
+  dplyr::left_join(dx, by = c("subject_id" = "PTID")) |>
+  dplyr::select(RID, subject_id, VISCODE2 = visit, AGE = entry_age, PTGENDER, DIAGNOSIS, GENOTYPE, ABETA42, PTAU, TAU)
+
+rm(dx) # clean-up after yourself!
+
+# METABOLOMICS ------------------------------------------------------------------
+# load metabolomics
+mets <- read.table(file.path(dir_cohort, "CruchagaLab_CSF_metabolomic_matrix_20230620.csv"), sep = ",", header = T)
+mets <- mets |>
+  dplyr::left_join(metadata, by = c("RID", "VISCODE2")) |>
+  dplyr::select(RID, subject_id, EXAMDATE, VISCODE2, AGE, PTGENDER, DIAGNOSIS, GENOTYPE, ABETA42, PTAU, TAU, everything()) |>
+  dplyr::select(-GUSPECID, -Metabolon_Barcode) |>
+  distinct()
+
+# annotate metabolites
+mets_annot <- read.table(file.path(dir_cohort, "ADNI_Cruchaga_lab_ADNI_CSF_metabolomic_info_20_06_2023.csv"), sep = ",", header = T)
+mets_annot <- mets_annot |>
+  dplyr::filter(PLOT_NAME %in% c(
+    "glucose", "glucose 6-phosphate", "UDP-glucose", "erythritol", "UDP-galactose",
+    "galactose 1-phosphate", "mannitol/sorbitol", "xylose", "ribose", "arabitol/xylitol", "myo-inositol",
+    "ribonate", "gluconate", "threonate", "glycerate"
+  ))
+mets_annot <- mets_annot |>
+  dplyr::select(ChemID, PLOT_NAME)
+
+# Filter and check normality for metabolomics
+mets <- mets |>
+  dplyr::select(RID, subject_id, EXAMDATE, VISCODE2, AGE, PTGENDER, DIAGNOSIS, GENOTYPE, ABETA42, PTAU, TAU, all_of(mets_annot$ChemID))
+mets[, 12:20] <- sapply(mets[, 12:20], log)
+
+### compute ratios glucose/sorbitol and glucose/erythritol
+mets$gluc.sorb <- mets$X572 - mets$X100001740
+mets$gluc.ery <- mets$X572 - mets$X100000846
+
+names(mets)[12:20] <- make.names(mets_annot$PLOT_NAME)
+metabolomics <- mets
+
+rm(metadata, mets, mets_annot) # clean-up after yourself!
+```
+
+```{r}
+## merge SNPs data with Cruchaga cohort
+snp <- read.delim(file.path(dir_genetics, "adni_polyol_genotypes.RAW"))
+metabolomics <- metabolomics |>
+  dplyr::left_join(snp |> dplyr::select(-FID), by = c("subject_id" = "IID"))
+
+rm(snp) # clean up after yourself
+metabolomics_noNA <- metabolomics |>
+  dplyr::filter(
+    !is.na(rs2229540_A),
+    !is.na(rs10508282_C),
+    !is.na(rs10508287_A),
+    !is.na(rs10508288_A),
+    !is.na(rs11231825_C),
+    !is.na(rs2847153_G),
+    !is.na(rs7239738_A)
+  )
+
+write.table(metabolomics, file.path(dir_genetics, "Cruchaga_metabolomics_relevant.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+
+```{r}
+## compute genetic score unweighted and weighted
+## we'll keep one of the three ribonate associations that are similar, as they are basically the same SNPs and we want to avoid collinearity issues
+
+# Option 1: Simple unweighted sum
+metabolomics_noNA <- metabolomics_noNA |>
+  dplyr::mutate(GRS_unw = rs2229540_A + rs10508287_A + rs11231825_C + rs2847153_G + rs7239738_A)
+
+write.table(metabolomics_noNA, file.path(dir_genetics, "Cruchaga_metabolomics_relelevant_WITHGENETICS.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+
+# Mediation replication results 
+
+::: {.panel-tabset}
+
+## tTau mediation
+
+### Mediation results
+```{r}
+## read in the SEM results (run in python outside of the report)
+# read in all tTau results files
+files <- list.files(dir_genetics, pattern = "*_TAU*", full.names = TRUE)
+files <- files[!grepl("boot", files)]
+files <- files[!grepl("loadings", files)]
+
+files_validation <- files[grepl("full", files)]
+
+# Concatenate all
+df_list <- lapply(files_validation, read.csv)
+master_df <- bind_rows(df_list)
+
+# Define custom order
+contrast_order <- c("HC_vs_MCI", "HC_vs_AD", "MCI_vs_AD")
+master_df$Contrast <- factor(master_df$Contrast, levels = contrast_order, ordered = TRUE)
+
+master_df$`Estimate (95% CI)` <- mapply(
+  format_result,
+  master_df$Estimate,
+  master_df$CI_Lower,
+  master_df$CI_Upper
+)
+
+# Sort by Contrast and Effect
+table_display <- master_df |> arrange(Contrast, Effect)
+
+
+# Display with Grouping
+final_table <- table_display |>
+  dplyr::select(Contrast, Effect, `Estimate (95% CI)`, p_val)
+
+colnames(final_table) <- c("Clinical Contrast", "Pathway", "Beta [95% CI]", "p-value")
+knitr::kable(final_table)
+```
+
+
+### Metabolite contributions (loadings)
+
+```{r loadings, fig.width = 12, fig.height = 6.5}
+# Loadings files
+files <- list.files(dir_genetics, pattern = "*_TAU*", full.names = TRUE)
+files <- files[grepl("loadings", files)]
+files <- files[grepl("full", files)]
+
+df_loadings <- list()
+for (f in files) {
+  # Read the individual CSV
+  temp_df <- read.csv(f)
+
+  # Extract the contrast from filename
+  contrast_name <- basename(f) |>
+    str_replace("SEM_validation_loadings_", "") |>
+    str_replace("_TAU_none_full.csv", "")
+
+  # Add the column to the temporary dataframe
+  temp_df$Contrast <- contrast_name
+  df_loadings[[length(df_loadings) + 1]] <- temp_df
+}
+
+# Concatenate all
+master_loads_df <- bind_rows(df_loadings)
+
+# Reorder columns to put Contrast first
+master_loads_df <- master_loads_df |>
+  dplyr::select(Contrast, everything())
+master_loads_df <- master_loads_df |>
+  dplyr::left_join(feature_labels, by = c("Metabolite" = "current_names")) |>
+  dplyr::select(-Metabolite) |>
+  dplyr::select(Metabolite = plotting_names, Contrast, everything())
+
+master_loads_df$Contrast <- factor(master_loads_df$Contrast, levels = contrast_order)
+
+master_loads_df$pval_star <- case_when(
+  master_loads_df$fdr_p <= 0.001 ~ "***",
+  master_loads_df$fdr_p <= 0.01 ~ "**",
+  master_loads_df$fdr_p <= 0.05 ~ "*",
+  master_loads_df$fdr_p > 0.05 ~ "ns",
+)
+
+ggplot(master_loads_df, aes(Median_Loading, Metabolite)) +
+  geom_point(shape = 15) +
+  geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = pval_star),
+    x = 2.5, # Fixed x position
+    hjust = 0,
+    size = 3,
+    na.rm = TRUE,
+    fontface = "italic"
+  ) +
+  facet_wrap(~Contrast) +
+  theme_minimal() +
+  labs(
+    title = "Loadings for the tTau SEM models",
+    x = "Median loading contribution"
+  )
+
+master_loads_df_ttau <- master_loads_df |> dplyr::filter(Contrast == "HC_vs_AD")
+master_loads_df_ttau$biomarker <- "tTau"
+```
+
+
+## pTau mediation
+
+### Mediation results
+```{r}
+## read in the SEM results (run in python outside of the report)
+# read in all pTau results files
+files <- list.files(dir_genetics, pattern = "*_PTAU*", full.names = TRUE)
+files <- files[!grepl("boot", files)]
+files <- files[!grepl("loadings", files)]
+
+files_validation <- files[grepl("full", files)]
+
+# Concatenate all
+df_list <- lapply(files_validation, read.csv)
+master_df <- bind_rows(df_list)
+
+# Define custom order
+contrast_order <- c("HC_vs_MCI", "HC_vs_AD", "MCI_vs_AD")
+master_df$Contrast <- factor(master_df$Contrast, levels = contrast_order, ordered = TRUE)
+
+master_df$`Estimate (95% CI)` <- mapply(
+  format_result,
+  master_df$Estimate,
+  master_df$CI_Lower,
+  master_df$CI_Upper
+)
+
+# Sort by Contrast and Effect
+table_display <- master_df |> arrange(Contrast, Effect)
+
+
+# Display with Grouping
+final_table <- table_display |>
+  dplyr::select(Contrast, Effect, `Estimate (95% CI)`, p_val)
+
+colnames(final_table) <- c("Clinical Contrast", "Pathway", "Beta [95% CI]", "p-value")
+knitr::kable(final_table)
+```
+
+
+### Metabolite contributions (loadings)
+
+```{r loadings ptau, fig.width = 12, fig.heigth = 6.5}
+# Loadings files
+files <- list.files(dir_genetics, pattern = "*_PTAU*", full.names = TRUE)
+files <- files[grepl("loadings", files)]
+files <- files[grepl("full", files)]
+
+df_loadings <- list()
+for (f in files) {
+  # Read the individual CSV
+  temp_df <- read.csv(f)
+
+  # Extract the contrast from filename
+  contrast_name <- basename(f) |>
+    str_replace("SEM_validation_loadings_", "") |>
+    str_replace("_PTAU_none_full.csv", "")
+
+  # Add the column to the temporary dataframe
+  temp_df$Contrast <- contrast_name
+  df_loadings[[length(df_loadings) + 1]] <- temp_df
+}
+
+# Concatenate all
+master_loads_df <- bind_rows(df_loadings)
+
+# Reorder columns to put Contrast first
+master_loads_df <- master_loads_df |>
+  dplyr::select(Contrast, everything())
+master_loads_df <- master_loads_df |>
+  dplyr::left_join(feature_labels, by = c("Metabolite" = "current_names")) |>
+  dplyr::select(-Metabolite) |>
+  dplyr::select(Metabolite = plotting_names, Contrast, everything())
+
+master_loads_df$Contrast <- factor(master_loads_df$Contrast, levels = contrast_order)
+
+master_loads_df$pval_star <- case_when(
+  master_loads_df$fdr_p <= 0.001 ~ "***",
+  master_loads_df$fdr_p <= 0.01 ~ "**",
+  master_loads_df$fdr_p <= 0.05 ~ "*",
+  master_loads_df$fdr_p > 0.05 ~ "ns",
+)
+
+ggplot(master_loads_df, aes(Median_Loading, Metabolite)) +
+  geom_point(shape = 15) +
+  geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = pval_star),
+    x = 2.5, # Fixed x position
+    hjust = 0,
+    size = 3,
+    na.rm = TRUE,
+    fontface = "italic"
+  ) +
+  facet_wrap(~Contrast) +
+  theme_minimal() +
+  labs(
+    title = "Loadings for the pTau SEM models",
+    x = "Median loading contribution"
+  )
+
+master_loads_df_ptau <- master_loads_df |> dplyr::filter(Contrast == "HC_vs_AD")
+master_loads_df_ptau$biomarker <- "pTau"
+```
+
+
+## Aβ42 mediation
+
+### Mediation results
+```{r}
+## read in the SEM results (run in python outside of the report)
+# read in all Aβ42  results files
+files <- list.files(dir_genetics, pattern = "*_ABETA42*", full.names = TRUE)
+files <- files[!grepl("boot", files)]
+files <- files[!grepl("loadings", files)]
+
+files_validation <- files[grepl("full", files)]
+
+# Concatenate all
+df_list <- lapply(files_validation, read.csv)
+master_df <- bind_rows(df_list)
+
+# Define custom order
+contrast_order <- c("HC_vs_MCI", "HC_vs_AD", "MCI_vs_AD")
+master_df$Contrast <- factor(master_df$Contrast, levels = contrast_order, ordered = TRUE)
+
+master_df$`Estimate (95% CI)` <- mapply(
+  format_result,
+  master_df$Estimate,
+  master_df$CI_Lower,
+  master_df$CI_Upper
+)
+
+# Sort by Contrast and Effect
+table_display <- master_df |> arrange(Contrast, Effect)
+
+
+# Display with Grouping
+final_table <- table_display |>
+  dplyr::select(Contrast, Effect, `Estimate (95% CI)`, p_val)
+
+colnames(final_table) <- c("Clinical Contrast", "Pathway", "Beta [95% CI]", "p-value")
+knitr::kable(final_table)
+```
+
+
+### Metabolite contributions (loadings)
+
+```{r loadings ab42, fig.width = 12, fig.height = 6.5}
+# Loadings files
+files <- list.files(dir_genetics, pattern = "*_ABETA42*", full.names = TRUE)
+files <- files[grepl("loadings", files)]
+files <- files[grepl("full", files)]
+
+df_loadings <- list()
+for (f in files) {
+  # Read the individual CSV
+  temp_df <- read.csv(f)
+
+  # Extract the contrast from filename
+  contrast_name <- basename(f) |>
+    str_replace("SEM_validation_loadings_", "") |>
+    str_replace("_ABETA42_none_full.csv", "")
+
+  # Add the column to the temporary dataframe
+  temp_df$Contrast <- contrast_name
+  df_loadings[[length(df_loadings) + 1]] <- temp_df
+}
+
+# Concatenate all
+master_loads_df <- bind_rows(df_loadings)
+
+# Reorder columns to put Contrast first
+master_loads_df <- master_loads_df |>
+  dplyr::select(Contrast, everything())
+master_loads_df <- master_loads_df |>
+  dplyr::left_join(feature_labels, by = c("Metabolite" = "current_names")) |>
+  dplyr::select(-Metabolite) |>
+  dplyr::select(Metabolite = plotting_names, Contrast, everything())
+
+master_loads_df$Contrast <- factor(master_loads_df$Contrast, levels = contrast_order)
+
+master_loads_df$pval_star <- case_when(
+  master_loads_df$fdr_p <= 0.001 ~ "***",
+  master_loads_df$fdr_p <= 0.01 ~ "**",
+  master_loads_df$fdr_p <= 0.05 ~ "*",
+  master_loads_df$fdr_p > 0.05 ~ "ns",
+)
+
+ggplot(master_loads_df, aes(Median_Loading, Metabolite)) +
+  geom_point(shape = 15) +
+  geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = pval_star),
+    x = 2.5, # Fixed x position
+    hjust = 0,
+    size = 3,
+    na.rm = TRUE,
+    fontface = "italic"
+  ) +
+  facet_wrap(~Contrast) +
+  theme_minimal() +
+  labs(
+    title = "Loadings for the Aβ42 SEM models",
+    x = "Median loading contribution"
+  )
+
+master_loads_df_ab42 <- master_loads_df |> dplyr::filter(Contrast == "HC_vs_AD")
+master_loads_df_ab42$biomarker <- "Aβ42"
+```
+
+:::
+
+# Discovery vs validation cohort graphic
+```{r, fig.width=7.5, fig.height=4.5}
+dis_files <- list.files(dir_discovery, pattern = "SEM_mediation_table_.*\\.csv", full.names = TRUE)
+dis_list <- lapply(dis_files, read.csv)
+dis_results <- bind_rows(dis_list)
+dis_results <- dis_results |>
+  dplyr::filter(Effect == "Indirect") |>
+  dplyr::select(Contrast, Mediator, Estimate, CI_Lower, CI_Upper, p_val) |>
+  dplyr::mutate(Cohort = "Discovery")
+
+val_results <- read.table(file.path(dir_genetics, "all_validation_results.csv"), sep = ",", header = T)
+val_results <- val_results |>
+  dplyr::filter(Dataset == "full", Effect == "Indirect") |>
+  dplyr::select(Contrast, Mediator, Estimate, CI_Lower, CI_Upper, p_val) |>
+  dplyr::mutate(Cohort = "Validation")
+
+
+all_results <- rbind(
+  dis_results,
+  val_results
+)
+all_results <- all_results |>
+  dplyr::mutate(Mediator = case_when(
+    Mediator == "ABETA42" ~ "Aβ42",
+    Mediator == "TAU" ~ "tTau",
+    Mediator == "PTAU" ~ "pTau"
+  )) |>
+  dplyr::mutate(Mediator = factor(Mediator, levels = c("tTau", "pTau", "Aβ42"))) |>
+  dplyr::mutate(
+    sig_label = case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+
+# Define a consistent dodge width
+pd <- position_dodge(width = 0.9)
+
+all_results |>
+  dplyr::filter(Contrast %in% intersect(dis_results$Contrast, val_results$Contrast)) |>
+  dplyr::mutate(Contrast = gsub("_", " ", Contrast)) |> 
+  dplyr::mutate(Contrast = gsub("HC", "NCI", Contrast)) |> 
+  dplyr::mutate(Contrast = factor(Contrast, levels = c("NCI vs MCI", "NCI vs AD", "MCI vs AD"))) |>  
+  ggplot(aes(Estimate, fct_rev(Contrast), group = Cohort, color = Mediator, shape = Cohort)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(size = 3, position = pd) +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper),
+    height = 0.2,
+    position = pd
+  ) +
+  geom_text(aes(x = max(CI_Upper) + 0.05, label = sig_label),
+            position = pd,
+            hjust = 0,
+            show.legend = F,
+            color = "black", 
+            fontface = "italic", 
+            size = 3) +
+  facet_wrap(~Mediator, ncol = 1, scales = "free_x") +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "Indirect effect (β)",
+    y = "Clinical Contrast",
+    title = "Mediation Effects Evaluation in Discovery and Validation cohorts",
+    caption = "p-values: *** p<0.001; ** p < 0.01; * p < 0.05; ns p > 0.05"
+  ) +
+  theme_minimal()
+```
+
+
+```{r fig.width=13, fig.height=4.5}
+cowplot::plot_grid(
+  ggplot(master_loads_df_ttau, aes(Median_Loading, Metabolite)) +
+    geom_point(shape = 15) +
+    geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+    geom_vline(xintercept = 0, linetype = 'dashed') +
+    geom_text(aes(label = pval_star, x = CI_Upper), 
+              # x = 2.5,       # Fixed x position
+              hjust = -0.3,
+              size = 3,
+              na.rm = TRUE,
+              fontface = 'italic') +
+    # facet_grid(~biomarker, scales = "free") +
+    theme_minimal() +
+    labs(
+         x = "Median loading contribution"),
+  ggplot(master_loads_df_ptau, aes(Median_Loading, Metabolite)) +
+    geom_point(shape = 15) +
+    geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+    geom_vline(xintercept = 0, linetype = 'dashed') +
+    geom_text(aes(label = pval_star, x = CI_Upper), 
+              # x = 2.5,       # Fixed x position
+              hjust = -0.3,
+              size = 3,
+              na.rm = TRUE,
+              fontface = 'italic') +
+    # facet_grid(~biomarker, scales = "free") +
+    theme_minimal() +
+    labs(
+         x = "Median loading contribution"),
+  ggplot(master_loads_df_ab42, aes(Median_Loading, Metabolite)) +
+    geom_point(shape = 15) +
+    geom_linerange(aes(xmin = CI_Lower, xmax = CI_Upper)) +
+    geom_vline(xintercept = 0, linetype = 'dashed') +
+    geom_text(aes(label = pval_star, x = CI_Upper), 
+              # x = 2.5,       # Fixed x position
+              hjust = -0.3,
+              size = 3,
+              na.rm = TRUE,
+              fontface = 'italic') +
+    # facet_grid(~biomarker, scales = "free") +
+    theme_minimal() +
+    labs(
+         x = "Median loading contribution"),
+  ncol = 3, labels = c("tTau", "pTau", "Aβ42")
+)
+
+```
+
+# Genetics evaluation
+Since the genetics evaluation was performed on a subset of the individuals, due to the genotype being only available on only a set of individuals, we did include an evaluation on how well the subset of individuals replicated the full ADNIGO/2 dataset. In total, we have `r nrow(metabolomics_noNA)` individuals with metabolomics AND the 7 SNPs genotyped in the ADNIGO/2 cohort.
+
+```{r}
+metabolomics <- metabolomics |>
+  dplyr::mutate(
+    DIAGNOSIS =
+      dplyr::case_when(
+        DIAGNOSIS == 1 ~ "HC",
+        DIAGNOSIS == 2 ~ "MCI",
+        DIAGNOSIS == 3 ~ "AD"
+      )
+  ) |>
+  dplyr::mutate(PTGENDER = ifelse(PTGENDER == 1, "Male", "Female"))
+
+
+metabolomics_noNA <- metabolomics_noNA |>
+  dplyr::mutate(
+    DIAGNOSIS =
+      dplyr::case_when(
+        DIAGNOSIS == 1 ~ "HC",
+        DIAGNOSIS == 2 ~ "MCI",
+        DIAGNOSIS == 3 ~ "AD"
+      )
+  ) |>
+  dplyr::mutate(PTGENDER = ifelse(PTGENDER == 1, "Male", "Female"))
+
+# Create comparison table
+comparison <- tibble(
+  Characteristic = c(
+    "Total Samples", "HC", "MCI", "AD",
+    "Age (mean±SD)", "Female %"
+  ),
+  `Full Cohort` = c(
+    nrow(metabolomics),
+    sum(metabolomics$DIAGNOSIS == "HC", na.rm = T),
+    sum(metabolomics$DIAGNOSIS == "MCI", na.rm = T),
+    sum(metabolomics$DIAGNOSIS == "AD", na.rm = T),
+    paste0(
+      round(mean(metabolomics$AGE, na.rm = T), 1), "±",
+      round(sd(metabolomics$AGE, na.rm = T), 1)
+    ),
+    paste0(round(sum(metabolomics$PTGENDER == "Female", na.rm = T) / nrow(metabolomics) * 100, 1), "%")
+  ),
+  `Genetics Subset` = c(
+    nrow(metabolomics_noNA),
+    sum(metabolomics_noNA$DIAGNOSIS == "HC", na.rm = T),
+    sum(metabolomics_noNA$DIAGNOSIS == "MCI", na.rm = T),
+    sum(metabolomics_noNA$DIAGNOSIS == "AD", na.rm = T),
+    paste0(
+      round(mean(metabolomics_noNA$AGE, na.rm = T), 1), "±",
+      round(sd(metabolomics_noNA$AGE, na.rm = T), 1)
+    ),
+    paste0(round(sum(metabolomics_noNA$PTGENDER == "Female", na.rm = T) / nrow(metabolomics_noNA) * 100, 1), "%")
+  ),
+  `Coverage %` = c(
+    paste0(round(nrow(metabolomics_noNA) / nrow(metabolomics) * 100, 1), "%"),
+    paste0(round(sum(metabolomics_noNA$DIAGNOSIS == "HC", na.rm = T) / sum(metabolomics$DIAGNOSIS == "HC", na.rm = T) * 100, 1), "%"),
+    paste0(round(sum(metabolomics_noNA$DIAGNOSIS == "MCI", na.rm = T) / sum(metabolomics$DIAGNOSIS == "MCI", na.rm = T) * 100, 1), "%"),
+    paste0(round(sum(metabolomics_noNA$DIAGNOSIS == "AD", na.rm = T) / sum(metabolomics$DIAGNOSIS == "AD", na.rm = T) * 100, 1), "%"),
+    "—",
+    "—"
+  )
+)
+
+knitr::kable(comparison)
+```
+
+**Interpretation:** The genetics subset represents 41% of the full validation cohort with similar demographic characteristics, suggesting it is representative for genetic analyses.
+
+
+According to the used references and the effect alleles extracted by PLINK in the ADNIGO/2 cohort, the effect size (beta) are:
+
+| RSID       | Allele | Metabolite          | Beta (β) | Reference        |
+|------------|--------|---------------------|----------|------------------|
+| rs2229540  | A      | Erythritol          | **+0.18**    | Long et al. 2017 |
+| rs7239738  | A      | Ribonate*           | **+0.14**    | Shin et al. 2014 |
+| rs2847153  | G      | Arabitol / Sorbitol | **-0.21**    | Shin et al. 2014 |
+| rs10508287 | A      | Ribonate            | **+0.41**    | Long et al. 2017 |
+| rs11231825 | C      | Threonate           | **-0.28**   | Long et al. 2017 |
+
+
+::: {.panel-tabset}
+
+```{r, results = 'asis'}
+pairs_snp_met <- list(
+  rs2229540 = c("rs2229540_A", "erythritol"),
+  rs7239738 = c("rs7239738_A", "ribonate"),
+  rs2847153 = c("rs2847153_G", "arabitol.xylitol"),
+  rs2847153b = c("rs2847153_G", "mannitol.sorbitol"),
+  rs10508287 = c("rs10508287_A", "ribonate"),
+  rs11231825 = c("rs11231825_C", "threonate")
+)
+
+for (pair in pairs_snp_met) {
+  cat("\n\n##", paste(pair, collapse = " vs "), "\n\n")
+  model <- lm(scale(metabolomics_noNA[[pair[2]]]) ~ metabolomics_noNA[[pair[1]]] + PTGENDER + AGE, data = metabolomics_noNA)
+  print(summary(model))
+  cat("\n\n")
+}
+```
+
+::: 
+
+We decided to use an *unweighted* GeneticRiskScore (GRS) by summing risk allele counts across all SNPs (range: 0-10). The unweighted approach was used given heterogeneity in study populations and metabolomics platforms across discovery GWAS.
+
+```{r}
+metabolomics_noNA |>
+  pull(GRS_unw) |>
+  table() |>
+  as.data.frame() |>
+  dplyr::rename(GRS_unw = Var1, n = Freq) |>
+  dplyr::mutate(percent = n / sum(n) * 100) |>
+  ggplot(aes(GRS_unw, percent)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(percent, 1), "%")),
+    vjust = -0.5, size = 3
+  ) +
+  labs(
+    x = "Genetic Risk Score",
+    y = "Number of Samples",
+    title = "Polyol Pathway Genetic Risk Score Distribution"
+  ) +
+  theme_minimal()
+```
+
+
+## Effect attenuation analysis
+Compare indirect effects across models to assess genetic confounding:
+
+```{r}
+## load all results
+results <- read.table(file.path(dir_genetics, "all_validation_results.csv"), sep = ",", header = T)
+results <- results |>
+  dplyr::filter(Effect == "Indirect") |>
+  dplyr::filter(Genetic_Model != "pathway") # keep indirect effects
+
+results <- results |>
+  dplyr::mutate(Mediator = case_when(
+    Mediator == "TAU" ~ "tTau",
+    Mediator == "PTAU" ~ "pTau",
+    Mediator == "ABETA42" ~ "Aβ42"
+  )) |>
+  dplyr::mutate(Mediator = factor(Mediator, levels = c("tTau", "pTau", "Aβ42")))
+```
+
+::: {.panel-tabset}
+
+### HC vs MCI
+
+```{r}
+## secondary focus: HC vs MCI
+results_hcmci <- results |>
+  dplyr::filter(Contrast == "HC_vs_MCI") |>
+  dplyr::filter(Mediator %in% c("tTau", "pTau", "Aβ42")) |>
+  dplyr::mutate(
+    Model_Label = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ "Full Dataset\n(n=687)",
+      Genetic_Model == "none" & Dataset == "genetics" ~ "Genetics Subset\n(n=282)",
+      Genetic_Model == "adjusted" ~ "With GRS\nAdjustment"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    Significant = p_val < 0.05
+  )
+
+
+ggplot(results_hcmci, aes(
+  x = reorder(Model_Label, Model_Order),
+  y = Estimate,
+  color = Mediator
+)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper),
+    width = 0.2, position = position_dodge(width = 0.5)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~Mediator, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "",
+    y = "Indirect Effect Estimate",
+    title = "Genetic Confounding Analysis: NCI vs MCI",
+    subtitle = "Comparison of indirect effects across replication and genetic adjustment models"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+```
+
+```{r}
+# Calculate attenuation for each mediator
+attenuation_mci <- results |>
+  dplyr::filter(
+    Contrast == "HC_vs_MCI",
+    Mediator %in% c("tTau", "pTau", "Aβ42"),
+    Effect == "Indirect",
+    Dataset == "genetics"
+  ) |>
+  dplyr::select(Mediator, Genetic_Model, Estimate, p_val, Sample_Size) |>
+  tidyr::pivot_wider(
+    names_from = Genetic_Model,
+    values_from = c(Estimate, p_val)
+  ) |>
+  dplyr::mutate(
+    `Attenuation (%)` = ((Estimate_none - Estimate_adjusted) / Estimate_none) * 100,
+    Interpretation = case_when(
+      abs(`Attenuation (%)`) < 25 ~ "Minimal - Effect persists",
+      abs(`Attenuation (%)`) > 75 ~ "Substantial - Genetic confounding",
+      TRUE ~ "Moderate - Partial contribution"
+    )
+  ) |>
+  dplyr::select(Mediator,
+    `Before Adjustment` = Estimate_none,
+    `p-value_pre` = p_val_none,
+    `After Adjustment` = Estimate_adjusted,
+    `p-value_adjustment` = p_val_adjusted,
+    `Attenuation (%)`,
+    Interpretation,
+    n = Sample_Size
+  )
+
+knitr::kable(attenuation_mci, digits = 3)
+```
+
+
+**Key Findings:**
+
+* **tTau**: [1.023%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, tTau and MCI
+* **pTau**: [2.663%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, pTau and MCI
+* **Aβ42**: [4.415%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect (albeit slightly higher) upon the relationship between the tested metabolites, Aβ42 and MCI
+
+```{r}
+# Prepare data for forest plot
+forest_data_mci <- results |>
+  dplyr::filter(
+    Contrast == "HC_vs_MCI",
+    Effect == "Indirect"
+  ) |>
+  dplyr::mutate(
+    Model = paste0(
+      case_when(
+        Genetic_Model == "none" & Dataset == "full" ~ "Replication (Full, n=",
+        Genetic_Model == "none" & Dataset == "genetics" ~ "Replication (Subset, n=",
+        Genetic_Model == "adjusted" ~ "Genetic Adjustment (n="
+      ),
+      Sample_Size, ")"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    sig_label = case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+ggplot(forest_data_mci, aes(Estimate, reorder(Model, -Model_Order), color = Mediator)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2) +
+  geom_text(aes(x = max(CI_Upper) + 0.05, label = sig_label)) +
+  facet_wrap(~Mediator, ncol = 1) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "Indirect Effect (95% CI)",
+    y = "",
+    title = "Comparison of Indirect Effects: Replication vs Genetic Adjustment",
+    subtitle = "NCI vs MCI | *p<0.05, **p<0.01, ***p<0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+#### Pathway Model: GRS → Metabolites → Biomarkers
+Test whether genetic effects are mediated through metabolite levels:
+
+```{r}
+# Extract path coefficients from pathway models
+# This requires parsing the semopy output more deeply
+# Placeholder for now - you'd need to extract:
+# - GRS → SugarAlcohol (path coefficient)
+# - SugarAlcohol → Biomarker (path coefficient)
+# - Biomarker → Outcome (path coefficient)
+# - GRS → Outcome (direct effect)
+
+# Create diagram or coefficient table
+
+
+model_stats <- results |>
+  filter(
+    Contrast == "HC_vs_MCI",
+    Effect == "Indirect"
+  ) %>%
+  select(
+    Mediator, Genetic_Model, Dataset, Sample_Size,
+    Convergence_Rate, p_val
+  ) %>%
+  mutate(
+    Model = paste0(Genetic_Model, " (", Dataset, ")"),
+    Significant = ifelse(p_val < 0.05, "Yes", "No")
+  ) %>%
+  select(Mediator, Model,
+    `Sample Size` = Sample_Size,
+    `Convergence (%)` = Convergence_Rate,
+    `p < 0.05` = Significant
+  )
+
+knitr::kable(model_stats, digits = 1)
+```
+
+
+### HC vs AD
+
+```{r}
+## main focus: HC vs AD
+results_hcad <- results |>
+  dplyr::filter(Contrast == "HC_vs_AD") |>
+  dplyr::filter(Mediator %in% c("tTau", "pTau", "Aβ42")) |>
+  dplyr::mutate(
+    Model_Label = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ "Full Dataset\n(n=687)",
+      Genetic_Model == "none" & Dataset == "genetics" ~ "Genetics Subset\n(n=282)",
+      Genetic_Model == "adjusted" ~ "With GRS\nAdjustment"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    Significant = p_val < 0.05
+  )
+
+
+ggplot(results_hcad, aes(
+  x = reorder(Model_Label, Model_Order),
+  y = Estimate,
+  color = Mediator
+)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper),
+    width = 0.2, position = position_dodge(width = 0.5)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~Mediator, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "",
+    y = "Indirect Effect Estimate",
+    title = "Genetic Confounding Analysis: NCI vs AD",
+    subtitle = "Comparison of indirect effects across replication and genetic adjustment models"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+```
+
+```{r}
+# Calculate attenuation for each mediator
+attenuation <- results |>
+  dplyr::filter(
+    Contrast == "HC_vs_AD",
+    Mediator %in% c("tTau", "pTau", "Aβ42"),
+    Effect == "Indirect",
+    Dataset == "genetics"
+  ) |>
+  dplyr::select(Mediator, Genetic_Model, Estimate, p_val, Sample_Size) |>
+  tidyr::pivot_wider(
+    names_from = Genetic_Model,
+    values_from = c(Estimate, p_val)
+  ) |>
+  dplyr::mutate(
+    `Attenuation (%)` = ((Estimate_none - Estimate_adjusted) / Estimate_none) * 100,
+    Interpretation = case_when(
+      abs(`Attenuation (%)`) < 25 ~ "Minimal - Effect persists",
+      abs(`Attenuation (%)`) > 75 ~ "Substantial - Genetic confounding",
+      TRUE ~ "Moderate - Partial contribution"
+    )
+  ) |>
+  dplyr::select(Mediator,
+    `Before Adjustment` = Estimate_none,
+    `p-value_pre` = p_val_none,
+    `After Adjustment` = Estimate_adjusted,
+    `p-value_adjustment` = p_val_adjusted,
+    `Attenuation (%)`,
+    Interpretation,
+    n = Sample_Size
+  )
+
+knitr::kable(attenuation, digits = 3)
+```
+
+
+**Key Findings:**
+
+* **tTau**: [1.023%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, tTau and AD
+* **pTau**: [2.663%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, pTau and AD
+* **Aβ42**: [4.415%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect (albeit slightly higher) upon the relationship between the tested metabolites, Aβ42 and AD
+
+```{r}
+# Prepare data for forest plot
+forest_data <- results |>
+  dplyr::filter(
+    Contrast == "HC_vs_AD",
+    Effect == "Indirect"
+  ) |>
+  dplyr::mutate(
+    Model = paste0(
+      case_when(
+        Genetic_Model == "none" & Dataset == "full" ~ "Replication (Full, n=",
+        Genetic_Model == "none" & Dataset == "genetics" ~ "Replication (Subset, n=",
+        Genetic_Model == "adjusted" ~ "Genetic Adjustment (n="
+      ),
+      Sample_Size, ")"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    sig_label = case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+ggplot(forest_data, aes(Estimate, reorder(Model, -Model_Order), color = Mediator)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2) +
+  geom_text(aes(x = max(CI_Upper) + 0.075, label = sig_label)) +
+  facet_wrap(~Mediator, ncol = 1) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "Indirect Effect (95% CI)",
+    y = "",
+    title = "Comparison of Indirect Effects: Replication vs Genetic Adjustment",
+    subtitle = "NCI vs AD | *p<0.05, **p<0.01, ***p<0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+#### Pathway Model: GRS → Metabolites → Biomarkers
+Test whether genetic effects are mediated through metabolite levels:
+
+```{r}
+# Extract path coefficients from pathway models
+# This requires parsing the semopy output more deeply
+# Placeholder for now - you'd need to extract:
+# - GRS → SugarAlcohol (path coefficient)
+# - SugarAlcohol → Biomarker (path coefficient)
+# - Biomarker → Outcome (path coefficient)
+# - GRS → Outcome (direct effect)
+
+# Create diagram or coefficient table
+
+
+model_stats <- results |>
+  filter(
+    Contrast == "HC_vs_AD",
+    Effect == "Indirect"
+  ) %>%
+  select(
+    Mediator, Genetic_Model, Dataset, Sample_Size,
+    Convergence_Rate, p_val
+  ) %>%
+  mutate(
+    Model = paste0(Genetic_Model, " (", Dataset, ")"),
+    Significant = ifelse(p_val < 0.05, "Yes", "No")
+  ) %>%
+  select(Mediator, Model,
+    `Sample Size` = Sample_Size,
+    `Convergence (%)` = Convergence_Rate,
+    `p < 0.05` = Significant
+  )
+
+knitr::kable(model_stats, digits = 1)
+```
+
+
+### MCI vs AD
+
+```{r}
+## secondary focus: MCI vs AD
+results_mciad <- results |>
+  dplyr::filter(Contrast == "MCI_vs_AD") |>
+  dplyr::filter(Mediator %in% c("tTau", "pTau", "Aβ42")) |>
+  dplyr::mutate(
+    Model_Label = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ "Full Dataset\n(n=687)",
+      Genetic_Model == "none" & Dataset == "genetics" ~ "Genetics Subset\n(n=282)",
+      Genetic_Model == "adjusted" ~ "With GRS\nAdjustment"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    Significant = p_val < 0.05
+  )
+
+
+ggplot(results_mciad, aes(
+  x = reorder(Model_Label, Model_Order),
+  y = Estimate,
+  color = Mediator
+)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper),
+    width = 0.2, position = position_dodge(width = 0.5)
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  facet_wrap(~Mediator, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "",
+    y = "Indirect Effect Estimate",
+    title = "Genetic Confounding Analysis: MCI vs AD",
+    subtitle = "Comparison of indirect effects across replication and genetic adjustment models"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+```
+
+```{r}
+# Calculate attenuation for each mediator
+attenuation_mciad <- results |>
+  dplyr::filter(
+    Contrast == "MCI_vs_AD",
+    Mediator %in% c("tTau", "pTau", "Aβ42"),
+    Effect == "Indirect",
+    Dataset == "genetics"
+  ) |>
+  dplyr::select(Mediator, Genetic_Model, Estimate, p_val, Sample_Size) |>
+  tidyr::pivot_wider(
+    names_from = Genetic_Model,
+    values_from = c(Estimate, p_val)
+  ) |>
+  dplyr::mutate(
+    `Attenuation (%)` = ((Estimate_none - Estimate_adjusted) / Estimate_none) * 100,
+    Interpretation = case_when(
+      abs(`Attenuation (%)`) < 25 ~ "Minimal - Effect persists",
+      abs(`Attenuation (%)`) > 75 ~ "Substantial - Genetic confounding",
+      TRUE ~ "Moderate - Partial contribution"
+    )
+  ) |>
+  dplyr::select(Mediator,
+    `Before Adjustment` = Estimate_none,
+    `p-value_pre` = p_val_none,
+    `After Adjustment` = Estimate_adjusted,
+    `p-value_adjustment` = p_val_adjusted,
+    `Attenuation (%)`,
+    Interpretation,
+    n = Sample_Size
+  )
+
+knitr::kable(attenuation_mciad, digits = 3)
+```
+
+
+**Key Findings:**
+
+* **tTau**: [1.023%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, tTau and MCI/AD
+* **pTau**: [2.663%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect upon the relationship between the tested metabolites, pTau and MCI/AD
+* **Aβ42**: [4.415%] attenuation after genetic adjustment → genetics, or at least the tested SNPs, has a negligible effect (albeit slightly higher) upon the relationship between the tested metabolites, Aβ42 and MCI/AD
+
+```{r}
+# Prepare data for forest plot
+forest_data_mciad <- results |>
+  dplyr::filter(
+    Contrast == "MCI_vs_AD",
+    Effect == "Indirect"
+  ) |>
+  dplyr::mutate(
+    Model = paste0(
+      case_when(
+        Genetic_Model == "none" & Dataset == "full" ~ "Replication (Full, n=",
+        Genetic_Model == "none" & Dataset == "genetics" ~ "Replication (Subset, n=",
+        Genetic_Model == "adjusted" ~ "Genetic Adjustment (n=",
+        Genetic_Model == "pathway" ~ "Genetic Pathway (n="
+      ),
+      Sample_Size, ")"
+    ),
+    Model_Order = case_when(
+      Genetic_Model == "none" & Dataset == "full" ~ 1,
+      Genetic_Model == "none" & Dataset == "genetics" ~ 2,
+      Genetic_Model == "adjusted" ~ 3
+    ),
+    sig_label = case_when(
+      p_val < 0.001 ~ "***",
+      p_val < 0.01 ~ "**",
+      p_val < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+
+ggplot(forest_data_mciad, aes(Estimate, reorder(Model, -Model_Order), color = Mediator)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.2) +
+  geom_text(aes(x = max(CI_Upper) + 0.05, label = sig_label)) +
+  facet_wrap(~Mediator, ncol = 1) +
+  scale_color_manual(values = c("#1f77b4", "#ff7f0e", "#2ca02c")) +
+  labs(
+    x = "Indirect Effect (95% CI)",
+    y = "",
+    title = "Comparison of Indirect Effects: Replication vs Genetic Adjustment",
+    subtitle = "MCI vs AD | *p<0.05, **p<0.01, ***p<0.001"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+```
+
+#### Pathway Model: GRS → Metabolites → Biomarkers
+Test whether genetic effects are mediated through metabolite levels:
+
+```{r}
+# Extract path coefficients from pathway models
+# This requires parsing the semopy output more deeply
+# Placeholder for now - you'd need to extract:
+# - GRS → SugarAlcohol (path coefficient)
+# - SugarAlcohol → Biomarker (path coefficient)
+# - Biomarker → Outcome (path coefficient)
+# - GRS → Outcome (direct effect)
+
+# Create diagram or coefficient table
+
+
+model_stats <- results |>
+  filter(
+    Contrast == "MCI_vs_AD",
+    Effect == "Indirect"
+  ) %>%
+  select(
+    Mediator, Genetic_Model, Dataset, Sample_Size,
+    Convergence_Rate, p_val
+  ) %>%
+  mutate(
+    Model = paste0(Genetic_Model, " (", Dataset, ")"),
+    Significant = ifelse(p_val < 0.05, "Yes", "No")
+  ) %>%
+  select(Mediator, Model,
+    `Sample Size` = Sample_Size,
+    `Convergence (%)` = Convergence_Rate,
+    `p < 0.05` = Significant
+  )
+
+knitr::kable(model_stats, digits = 1)
+```
+
+
+
+:::
+
+### Summary
+
+**Main Conclusions:**
+
+1. **Sample Representativeness**: The genetics subset (n=X, Y% of full cohort) showed similar demographic characteristics and effect sizes compared to the full validation cohort, confirming it is representative.
+
+2. **SNP-Metabolite Replication**: [X/5] published SNP-metabolite associations successfully replicated in our validation cohort, supporting the relevance of the genetic instruments.
+
+3. **Genetic Confounding Assessment**:
+   - **tTau mediation**: [X]% attenuation after GRS adjustment → [interpretation]
+   - **pTau mediation**: [X]% attenuation after GRS adjustment → [interpretation]
+   - **Aβ42 mediation**: [X]% attenuation after GRS adjustment → [interpretation]
+
+4. **Overall Interpretation**: [Provide your interpretation based on attenuation patterns - do effects persist suggesting metabolic mechanisms, or are they explained by genetics?]

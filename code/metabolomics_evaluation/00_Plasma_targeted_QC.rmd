@@ -1,0 +1,535 @@
+---
+title: "Lundbeck project - Targeted Plasma CGMS metabolomics - Rigshospitalet - QC"
+author: "Marc Clos-Garcia"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: united
+date: "`r Sys.Date()`"
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo = FALSE}
+## libraries
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(factoextra)
+library(VIM)
+library(PCAtools)
+library(ropls)
+library(DT)
+library(gridExtra)
+library(MASS)
+library(ggfortify)
+library(DescTools)
+
+## directories
+dir_data <- here("data/Plasma")
+if (!dir.exists(dir_data)) dir.create(dir_data)
+dir_res <- here("results/Plasma")
+if (!dir.exists(dir_res)) dir.create(dir_res)
+dir_code <- here("code")
+if (!dir.exists(dir_code)) dir.create(dir_code)
+```
+
+```{r load and format datasets, echo=FALSE, message=FALSE, warning=FALSE}
+#### GC-MS
+targeted <- read.table(file.path(dir_data, "Targeted results 20230112.csv"), header = T, sep = ",", dec = ".")
+targeted <- targeted[, -c(1:2)]
+names(targeted)[1:5] <- as.character(targeted[1, 1:5])
+names(targeted) <- gsub("\\.Results$", "", names(targeted))
+targeted <- targeted[-1, ]
+
+###### extract sample numbers
+targeted$Name <- gsub("_backup", "", targeted$Name)
+targeted$`Data File` <- gsub("_backup", "", targeted$`Data File`)
+targeted <- targeted %>%
+    tidyr::separate("Data File", sep = "_", into = c("P_number", "P_name", "Date", "Run", "sample", "vial", "injection")) %>%
+    dplyr::mutate(sample = ifelse(is.na(sample), Name, sample)) %>%
+    dplyr::select(-P_number, -P_name, -Date, -vial, -injection) %>%
+    as.data.frame()
+
+#### clinical - sample IDs
+mtdt <- read.delim(file.path(dir_data, "Sample codenumbers plus data 2023_01_03_KH.csv"), header = T, sep = ",")
+
+#### IDs matching file
+matching <- read.table(file.path(dir_data, "0111_Lundbeck_QQQ_plasma_STENO_ID_DDBBno_each_sample.csv"), header = T, sep = ",", skip = 1)
+matching <- matching[, -3]
+```
+
+
+```{r add DDBBno ids to metadata and merge all files, echo=FALSE, message=FALSE, warning=FALSE}
+#### add ID to metadata
+mtdt <- mtdt %>%
+    dplyr::left_join(matching, by = "DDBBno") %>%
+    dplyr::select(STENO.ID, DDBBno, everything())
+mtdt$STENO.ID <- as.character(mtdt$STENO.ID)
+
+#### add extra metadata
+extra_metadata <- readxl::read_excel(file.path(dir_data, "RH_Clinical info BMI_Statin_HRT_2025_06_23.xlsx"), sheet = 1, col_names = T)
+extra_metadata <- extra_metadata %>% dplyr::select(DDBBno, BMI, Statins, "Hormone replacement therapy", `Neuropsychology_ACE_Total score`, `Genetics_Risk factors_APOE`, CSF_glucose = "Cerebrospinal fluids_Glucose#mmol/l")
+
+mtdt <- mtdt %>% 
+  dplyr::left_join(extra_metadata, by = "DDBBno") %>% 
+  dplyr::mutate(Statins = ifelse(Statins == "Nej", 0, 1)) %>% 
+  dplyr::mutate("Hormone replacement therapy" = ifelse(`Hormone replacement therapy` == "Nej", 0, 1))
+mtdt$STENO.ID <- as.character(mtdt$STENO.ID)
+
+#### merge metabolomics with metadata
+targeted <- targeted %>%
+    dplyr::left_join(mtdt, by = c("sample" = "STENO.ID")) %>%
+    dplyr::select(
+        Name, sample, DDBBno, Run, Type, Level, "Acq. Date-Time", Gender, AgeAtVisit, CognitiveSyndrome,
+        Diagnosis, Class, MMSE_Score, Cerebrospinal.fluids_Amyloid.beta.42.pg.ml,
+        Cerebrospinal.fluids_Phospho.Tau.pg.ml, Cerebrospinal.fluids_Total.Tau.pg.ml, BMI, 
+        Statins, "Hormone replacement therapy", "Neuropsychology_ACE_Total score", 
+        "Genetics_Risk factors_APOE", CSF_glucose, everything()
+    )
+
+## clean up
+rm(matching)
+```
+
+```{r data transformations, echo=FALSE, message=FALSE, warning=FALSE}
+## data transformations
+### transform to numbers
+targeted[, 23:ncol(targeted)] <- sapply(targeted[, 23:ncol(targeted)], as.numeric) ## convert to numeric
+```
+
+# Context
+In this report, we perform a quality-control evaluation of the targeted metabolomics dataset. In total, the dataset included up to `r ncol(targeted[, 17:ncol(targeted)])` annotated targeted metabolites. The process presented here includes:
+
+* Evaluating the ratios between blanks and samples
+* Evaluation of Coefficient of Variation (CV) in the sample pools
+* Identification and processing of duplicate samples
+* Missing values evaluation and imputation
+* Data normalization
+* Identification and removal of outliers
+
+# Check blanks vs other samples metabolites
+Looking at the metabolite average abundance per sample type, we see that only 4 metabolites not being present in blanks: *linoleic acid, oleic acid, stearic acid* and *threonine*.
+
+Ideally, we would like to keep only those metabolites not present in the blank samples or, at least, present in 3x times in the samples than in the blanks. 
+
+```{r check calbration curves, echo=FALSE, message=FALSE, warning=FALSE, fig.width=8, fig.height=8.75}
+targeted_cal <- targeted %>% dplyr::filter(Type == "Cal")
+targeted_cal$Name <- factor(targeted_cal$Name, levels = targeted_cal$Name)
+targeted_cal <- targeted_cal %>% dplyr::select(-c("Run", "Type", "Level", "Acq. Date-Time", "sample", "DDBBno", "Gender", "AgeAtVisit",
+                                                  "CognitiveSyndrome", "Diagnosis", "Class", "MMSE_Score",
+                                                  "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+                                                  "Cerebrospinal.fluids_Phospho.Tau.pg.ml", "Cerebrospinal.fluids_Total.Tau.pg.ml", "BMI",
+                                                  "Statins", "Hormone replacement therapy", 
+                                                  "Neuropsychology_ACE_Total score", "Genetics_Risk factors_APOE",
+                                                  "CSF_glucose")) 
+targeted_cal %>% 
+  reshape::melt() %>%
+  tidyr::separate(Name, into = c("Name", "Run")) %>%
+  dplyr::arrange(Name) %>% 
+  ggplot(aes(Name, value, color = Run, group = Run)) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~variable, scales = "free") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5))
+
+## remove calibration samples
+targeted <- targeted |> dplyr::filter(!grepl("Cal", sample))
+
+```
+
+
+
+# Check for duplicates {.tabset}
+```{r duplicates, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+# sort(table(targeted$sample), decreasing = TRUE) ## we check duplicates by sample name, no duplicates are observed except for blank17, CP17 and RPO17
+
+# Check missing patterns to see if any of them has more missing data
+# This is also a type of QCing the data to check how well duplicates correlate
+dups.df <- targeted[duplicated(targeted$sample), ]
+datatable(dups.df)
+
+dup.samples <- targeted[duplicated(targeted$sample), "sample"]
+
+for (x in dup.samples) {
+    cat("## ", x, "\n\n")
+    nas <- data.frame(cbind(
+        summary(rowSums(is.na(targeted[which(targeted$sample == x)[1], 23:ncol(targeted)]))),
+        summary(rowSums(is.na(targeted[which(targeted$sample == x)[2], 23:ncol(targeted)])))
+    ))
+    names(nas) <- which(targeted$sample == x)
+    print(htmltools::tagList(DT::datatable(nas,
+        escape = T, height = "100%", class = "cell-border stripe",
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    # Plot the two pairs of data
+    plot(t(targeted[which(targeted$sample == x), 23:ncol(targeted)]))
+    cat("\n\n")
+}
+
+## samples look very similar, we'll remove one duplicate randomly
+targeted <- targeted[!duplicated(targeted$sample), ]
+
+# clean up
+rm(dup.samples, nas)
+```
+
+
+# {.unnumbered .unlisted}
+We see `r nrow(dups.df)` duplicates. After evaluating the metabolites distribution across these duplicates, we decide to randomly remove one duplicate for each pair.
+
+# Missing values
+```{r NAs, echo=FALSE, message=FALSE, warning=FALSE}
+# Check participants with all met data missing
+targeted$allNA <- apply(targeted[, 23:ncol(targeted)],
+    MARGIN = 1, FUN = function(x) all(is.na(x))
+)
+
+summary(targeted$allNA)
+
+# NONE missing- remove allNA column
+targeted$allNA <- NULL
+
+
+# check missingess per individual
+summary(rowSums(is.na(targeted[, 23:ncol(targeted)])))
+hist(summary(rowSums(is.na(targeted[, 23:ncol(targeted)]))), breaks = 10)
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
+# 0.0000  0.0000  0.0000  0.3636  0.0000  6.0000
+
+row.names(targeted) <- targeted$sample
+
+
+## Exclude individuals with missing data in more than 20% of metabolites -!!!
+targeted.f <- targeted[, 23:ncol(targeted)][which(rowMeans(is.na(targeted[, 23:ncol(targeted)])) <= 0.2), ]
+
+# 0 individuals have more than 20% of missing data-> 297 individuals left
+
+# Exclude metabolites with missing data in more than 20% of metabolites
+targeted.f2 <- targeted.f[, which(colMeans(is.na(targeted.f)) <= 0.2), ]
+
+dim(targeted.f2)
+# [1]  297 30  left
+# no metabolites missing more than 20%
+
+## merge back the filtered dataset
+targeted.f <- merge(targeted[, 1:22], targeted.f2, by = "row.names")
+targeted.f$Row.names <- NULL
+dim(targeted.f)
+```
+
+No samples were removed due to the number of missing values (all <20%). 
+Missing values were imputed using kNN clustering approach with k=10.
+
+```{r impute missing values, echo=FALSE, message=FALSE, warning=FALSE}
+### impute missing values with kNN
+targeted.imp <- kNN(targeted.f[, 23:ncol(targeted.f)], k = 10)
+targeted.imp <- cbind(targeted.f[, 1:22], targeted.imp)
+targeted.imp <- targeted.imp %>%
+    dplyr::select(-contains("_imp")) %>%
+    as.data.frame()
+targeted.imp[, 23:ncol(targeted.imp)] <- sapply(targeted.imp[, 23:ncol(targeted.imp)], as.numeric) # convert metabolite data back to numeric
+
+rm(targeted, targeted.f, targeted.f2)
+```
+
+# Data normalization {.tabset}
+We normalized the metabolomics data by log10 transforming it. For both the raw and log10 transformed data we have plotted the individual metabolites abundance distribution histograms, pair-by-pair. The PDFs with such histogram plots can be find in `r dir_res`.
+We also show, below, the boxplots for the raw and log-transformed data, to rapidly evaluate the effectivness of the data transformation.
+```{r Visualize distribution 1, echo=FALSE, message=FALSE, warning=FALSE}
+# Vector of all lipids to iterate through
+Metabolite_names <- names(targeted.imp)[23:ncol(targeted.imp)]
+# Visualize histograms
+p <- list()
+for (j in Metabolite_names) {
+    p.raw <- ggplot(targeted.imp, aes(x = (targeted.imp[, j]))) +
+        geom_histogram(aes_string(x = targeted.imp[, j]), bins = 30) +
+        xlab(paste0(names(targeted.imp[j]), " - Raw")) +
+        theme(
+            axis.text = element_text(size = 5), axis.title = element_text(size = 5),
+            legend.text = element_text(size = 5), legend.title = element_text(size = 5)
+        )
+
+    p.log <- ggplot(targeted.imp, aes(x = log10(targeted.imp[, j]))) +
+        geom_histogram(aes_string(x = log10(targeted.imp[, j])), bins = 30) +
+        xlab(paste0(names(targeted.imp[j]), " - log10")) +
+        theme(
+            axis.text = element_text(size = 5),
+            axis.title = element_text(size = 5),
+            legend.text = element_text(size = 5),
+            legend.title = element_text(size = 5)
+        )
+
+    p[[j]] <- ggarrange(p.raw, p.log, ncol = 2)
+}
+
+# Write pdf with all figures
+# ggsave("Plasma_Histograms_raw_vs_log10_KNN_targetedmetabolomics.pdf",
+#        marrangeGrob(grobs=p, nrow=2, ncol=1),
+#        path = dir_res)
+# dev.off()
+```
+
+
+```{r Log Transformation, echo=FALSE, message=FALSE, warning=FALSE}
+# Log10 Transform
+targeted.nolog <- targeted.imp
+targeted.log <- targeted.imp
+targeted.log[,23:ncol(targeted.log)] <- as.data.frame(sapply(targeted.imp[, 23:ncol(targeted.imp)], log10))
+
+row.names(targeted.log) <- targeted.log$sample
+
+write.table(targeted.log, file.path(dir_data, "Plasma_targeted_logtransformed.txt"), row.names = FALSE, sep = "\t")
+
+```
+
+## Raw data distribution
+```{r raw bplots, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+bplot.raw <- cbind(sample = targeted.nolog$sample, targeted.nolog[, 23:ncol(targeted.nolog)])
+bplot.raw <- bplot.raw %>%
+    reshape2::melt()
+
+print(ggplot(bplot.raw, (aes(sample, value))) +
+    geom_boxplot(outlier.fill = NA) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = .5)))
+```
+
+## Log-transformed data distribution
+```{r logtransf bplots, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+bplot.log <- cbind(sample = targeted.log$sample, targeted.log[, 23:ncol(targeted.log)])
+bplot.log <- bplot.log %>%
+    reshape2::melt()
+
+print(ggplot(bplot.log, (aes(sample, value))) +
+    geom_boxplot(outlier.fill = NA) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = .5)))
+```
+
+## Log-transformed data distribution - without technical samples
+```{r exclude technical, echo=FALSE, message=FALSE, warning=FALSE}
+# edit metadata to change NAs for blank, etc
+targeted.log$fullClass <- ifelse(is.na(targeted.log$Class),
+    ifelse(grepl("lank", targeted.log$sample), "technical_blank",
+        ifelse(grepl("Cal", targeted.log$sample), "technical_Cal",
+            ifelse(grepl("CP", targeted.log$sample), "technical_CP",
+                ifelse(grepl("RPO", targeted.log$sample), "technical_RPO", NA)
+            )
+        )
+    ), targeted.log$Class
+)
+targeted.log <- targeted.log %>%
+    dplyr::relocate(fullClass, .after = "Cerebrospinal.fluids_Total.Tau.pg.ml")
+
+## remove technical samples
+targeted.log.f <- targeted.log %>%
+    dplyr::filter(!grepl("technical", fullClass)) %>%
+    dplyr::filter(!is.na(fullClass))
+
+bplot.log <- cbind(sample = targeted.log.f$sample, targeted.log.f[, 24:ncol(targeted.log.f)])
+bplot.log <- bplot.log %>%
+    reshape2::melt()
+
+print(ggplot(bplot.log, (aes(sample, value))) +
+    geom_boxplot(outlier.fill = NA) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = .5)))
+```
+
+
+
+# PCA
+```{r 1st PCA, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+autoplot(prcomp(targeted.log[, 24:ncol(targeted.log)], scale. = TRUE, center = TRUE), data = targeted.log, color = "fullClass")
+```
+
+## Without technical samples
+```{r 2nd PCA, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+autoplot(prcomp(targeted.log.f[, 24:ncol(targeted.log.f)], scale. = TRUE, center = TRUE), data = targeted.log.f, color = "fullClass")
+```
+
+# Outliers assessment - samples
+After exclusion of the technical samples, we cannot identify any outlier sample, neither in the PCA plots nor by distance to cluster center analysis.
+
+```{r outliers on samples, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+# check for outliers using a combination of PCA and kmeans clustering
+autoplot(pca_all <- prcomp(targeted.log.f[, 24:ncol(targeted.log.f)], center = TRUE, scale. = TRUE), data = targeted.log.f, colour = "fullClass", x = 1, y = 2, label = TRUE, label.size = 3)
+autoplot(pca_all <- prcomp(targeted.log.f[, 24:ncol(targeted.log.f)], center = TRUE, scale. = TRUE), data = targeted.log.f, colour = "fullClass", x = 1, y = 3, label = TRUE, label.size = 2)
+
+
+# investigate further with k-means clustering
+kmeans.result <- kmeans(targeted.log.f[, 24:ncol(targeted.log.f)], centers = 3)
+
+# "centers" is a data frame of 3 centers but the length of iris dataset so we can canlculate distance difference easily.
+centers <- kmeans.result$centers[kmeans.result$cluster, ]
+
+# calculate distance
+distances <- sqrt(rowSums((targeted.log.f[, 24:ncol(targeted.log.f)] - centers)^2))
+outliers_ids <- cbind(distances, targeted.log.f)
+outliers_ids2 <- cbind(kmeans.result$cluster, outliers_ids)
+
+outliers <- outliers_ids2[order(outliers_ids2$distances), ]
+
+# show ID of observations with the largest distance to the clusters
+tibble(outliers) %>%
+    dplyr::select(distances, sample) %>%
+    arrange(-distances)
+
+# all outliers with distances over 6
+outliers[outliers$distances > 6, "sample"]
+# targeted.log.f %>%
+#    dplyr::filter(sample == outliers[outliers$distances > 6, "sample"]) %>%
+#    dplyr::select(Name:fullClass) %>%
+#    DT::datatable(.)
+
+## remove outliers
+# targeted.log.f <- targeted.log.f %>%
+#    dplyr::filter(sample != outliers[outliers$distances > 6, "sample"]) %>%
+#    as.data.frame()
+```
+
+
+# Outliers identification - metabolites
+No differences are seen either pre- and post-winsorizing the metabolites data
+```{r outliers on metabolites, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+# Define outliers as anything outside the 0.01%-99.99% quantiles,
+# equivalent of  4xSD away from the mean.
+# Alternatively use 0.3%-99.7% equivalent of 3xSD from the mean.
+tmp_outlier_range <- c(0.0001, 0.9999)
+
+mets <- targeted.log.f[, 24:ncol(targeted.log.f)]
+row.names(mets) <- targeted.log.f$sample
+
+
+# Windsorizing outliers
+mets_wind <- tibble(mets) %>%
+    mutate(across(
+        where(is.numeric),
+        ~ Winsorize(., quantile(., probs = tmp_outlier_range))
+    )) %>%
+    data.frame()
+
+mets_wind <- cbind(targeted.log.f[, 1:23], mets_wind)
+
+# Visualize difference with PCA
+# Principal component 1 and 2
+autoplot(
+    pca_all <- prcomp(targeted.log.f[, 24:ncol(targeted.log.f)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = targeted.log.f, colour = "fullClass",
+    x = 1, y = 2, label = TRUE, label.size = 3
+) +
+    ggtitle("log-transformed metabolites PC 1 and 2")
+
+autoplot(
+    pca_all <- prcomp(mets_wind[, 24:ncol(mets_wind)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = mets_wind, colour = "fullClass",
+    x = 1, y = 2, label = TRUE, label.size = 3
+) +
+    ggtitle("windosrized log-transformed metabolites PC 1 and 2")
+
+
+# Principal component 3 and 4
+autoplot(
+    pca_all <- prcomp(targeted.log.f[, 24:ncol(targeted.log.f)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = targeted.log.f, colour = "fullClass",
+    x = 3, y = 4, label = TRUE, label.size = 3
+) +
+    ggtitle("log-transformed metabolites PC 3 and 4")
+
+autoplot(
+    pca_all <- prcomp(mets_wind[, 24:ncol(mets_wind)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = mets_wind, colour = "fullClass",
+    x = 3, y = 4, label = TRUE, label.size = 3
+) +
+    ggtitle("windosrized log-transformed metabolites PC 3 and 4")
+
+# Truncation of outlier lipid levels did not result in any particular difference for the log-transformed data
+
+rm(tmp_outlier_range, pca_all)
+```
+
+
+# Final PCA without outliers and normalized data
+```{r pca2, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 10, fig.height=5}
+color_key <- list(fullClass = c(
+    "No cognitive impairment" = "skyblue2",
+    "MCI_Non-AD" = "darkolivegreen3",
+    "MCI" = "goldenrod1",
+    "AD" = "salmon",
+    "VaD" = "darkred"
+))
+
+mets.f <- targeted.log.f[, 24:ncol(targeted.log.f)]
+row.names(mets.f) <- targeted.log.f$sample
+mets.mtdt.f <- targeted.log.f[, 1:23]
+row.names(mets.mtdt.f) <- targeted.log.f$sample
+pca.targeted2 <- PCAtools::pca(as.data.frame(t(mets.f)), metadata = mets.mtdt.f)
+screeplot(pca.targeted2, components = 1:25)
+```
+
+
+```{r pcatools biplot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=9}
+bplot <- biplot(pca.targeted2,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+```
+
+```{r pcatools pairs, echo=FALSE, message=FALSE, warning=FALSE, fig.height=12, fig.width=12}
+plot_legend <- get_legend(bplot)
+pplot <- pairsplot(pca.targeted2, colby = "fullClass", colkey = color_key$fullClass)
+print(cowplot::plot_grid(pplot, plot_legend, nrow = 2, rel_heights = c(1.9, 0.1)))
+```
+
+```{r save data, echo=FALSE, message=FALSE, warning=FALSE, eval = FALSE}
+targeted.log.f$fullClass <- gsub("No cognitive impairment", "HC", targeted.log.f$fullClass)
+write.table(targeted.log.f, file.path(dir_data, "Plasma_targeted_logtransformed.txt"), sep = "\t", row.names = F)
+```
+
+
+# Cohort - confirm we have the same numbers
+```{r metadata diff, echo=FALSE, message=FALSE, warning=FALSE}
+metadata <- targeted.log.f[, 1:23]
+metadata$Statins <- ifelse(metadata$Statins == 0, "No", "Yes")
+metadata$`Hormone replacement therapy` <- ifelse(metadata$`Hormone replacement therapy` == 0, "No", "Yes")
+
+
+library(tableone)
+## Vector of variables to summarize
+vars_test <- c(
+    "Gender", "AgeAtVisit", "CognitiveSyndrome", "Diagnosis", "MMSE_Score", "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml", "Cerebrospinal.fluids_Total.Tau.pg.ml", "BMI", "Statins",
+    "Hormone replacement therapy", "Neuropsychology_ACE_Total score", "Genetics_Risk factors_APOE", "CSF_glucose"
+)
+## Vector of categorical variables that need transformation
+catVars <- c("Gender", "CognitiveSyndrome", "Diagnosis")
+
+tab3 <- CreateTableOne(vars = vars_test, strata = "fullClass", data = metadata, factorVars = catVars)
+
+tab_df <- print(tab3, printToggle = FALSE, noSpaces = TRUE)
+tab_df <- tab_df[, -ncol(tab_df)]
+DT::datatable(tab_df, options = list(
+    scrollX = TRUE,
+    pageLength = nrow(tab_df), # or -1 to display all rows if you're using lengthMenu
+    lengthMenu = list(c(-1, 10, 25, 50), c("All", "10", "25", "50"))
+), class = "cell-border stripe")
+```
+
+# Session
+```{r session info, echo=FALSE, message=FALSE, warning=FALSE}
+pander::pander(sessionInfo())
+```

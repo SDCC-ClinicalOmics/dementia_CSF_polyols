@@ -1,0 +1,557 @@
+---
+title: 'Metabolite robustness stability assessment through models bootstrapping'
+author: 
+    - name: 'Marc Clos-Garcia'
+      affiliation: 'Steno Diabetes Center Copenhagen, Denmark'
+      email: 'marc.clos.garcia@regiong.dk'
+date: last-modified
+date-format: "D MMMM, YYYY"
+format: 
+    html:
+        toc: true
+        toc-depth: 3
+        number-sections: true
+        code-fold: true
+        code-summary: 'Click to expand/collapse code'
+        theme: cosmo
+---
+
+In this report, we assess the robustness and stability of the selected metabolites for dementia prediction using Elastic Net models. We perform bootstrapping of the models to evaluate how consistently each metabolite is selected across different resampled datasets. We only tested the models that were constructed considering age and gender as covariates.
+
+```{python}
+# import libraries
+import os as os
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import ElasticNetCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.utils import resample
+from sklearn.metrics import r2_score, mean_squared_error
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+import seaborn as sns
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# set random seed for reproducibility
+np.random.seed(235)
+```
+
+```{python}
+os.getcwd()
+models_dir = '../results/modelling/'
+```
+
+```{python}
+df = pd.read_csv('../data/csf_ratios2.csv', sep=';', encoding='latin1')
+
+df['TAU'] = StandardScaler().fit_transform(np.log(df['TAU']).values.reshape(-1,1)).ravel() 
+df['PTAU'] = StandardScaler().fit_transform(np.log(df['PTAU']).values.reshape(-1,1)).ravel() 
+df['ABETA42'] = StandardScaler().fit_transform(df['ABETA42'].values.reshape(-1,1)).ravel()
+
+# Define the 15 metabolites
+metabolites=['d.Glucose', 'gluc.erythitol', 'd.Galactose', 'gluc.sorbitol', 'D.....Xylose', 'D.....Ribofuranose', 'Sorbitol', 'L.....Arabitol', 'D.Threitol', 'meso.Erythritol', 'X3.Deoxy.erythro.pentitol', 'X1.5.Anhydrohexitol', 'Ribonic.acid', 'L.Threonic.acid', 'Glyceric.acid']
+```
+
+
+*Traditionally*, stable metabolites are defined according to their selection frequency across bootstrapped models. In this analysis, we define a metabolite as stable if it is selected in at least 70% of the bootstrapped models.
+
+* Selection frequency > 0.7 → highly robust
+
+* 0.5–0.7 → moderately stable
+
+* < 0.3 → likely unstable
+
+Metabolites consistently selected across bootstraps provide the most reliable biological signals.
+
+# Booststrapping results
+
+::: {.panel-tabset}
+
+## tTau prediction
+Metabolites stability (selection frequency) and mean contribution coefficients table:
+```{python}
+res_path = os.path.abspath(os.path.join(os.getcwd(), models_dir, 'bootstrap_TAU.pkl'))
+bootstrap_ttau = pd.read_pickle(res_path)
+
+# Summarize selection frequencies
+results_ttau = pd.DataFrame({
+    'metabolite': bootstrap_ttau['metabolites'],
+    'selection_frequency': bootstrap_ttau['selection_freq'],
+    'mean_coef': bootstrap_ttau['coef_matrix'].mean(axis=0),
+    'coef_lower_95': np.percentile(bootstrap_ttau['coef_matrix'], 2.5, axis=0),
+    'coef_upper_95': np.percentile(bootstrap_ttau['coef_matrix'], 97.5, axis=0)
+}).sort_values('selection_frequency', ascending=False)
+
+print(results_ttau)
+```
+
+Histogram of frequency selection:
+
+```{python}
+# plot stability
+plt.figure(figsize=(8,6))
+sns.histplot(bootstrap_ttau['selection_freq'], bins=20)
+plt.title("Distribution of selection frequencies (tTau)")
+plt.xlabel("Selection frequency")
+plt.show()
+```
+
+### Stable metabolites
+As defined by frequency of selection >70%
+
+
+```{python}
+stable_ttau = results_ttau[results_ttau.selection_frequency > 0.70]
+stable_ttau
+```
+
+Contributions to the model - some statistics on the bootstraps
+```{python}
+mean_coefs = bootstrap_ttau['coef_matrix'].mean(axis=0)
+# Sort metabolites by absolute mean coefficient (descending)
+sorted_idx = np.argsort(np.abs(mean_coefs))[::-1]
+sorted_metabolites = [bootstrap_ttau['metabolites'][i] for i in sorted_idx]
+sorted_coefs = bootstrap_ttau['coef_matrix'][:, sorted_idx]
+# print(sorted_coefs)
+# print(sorted_metabolites)
+
+
+# plot the general contribution
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=pd.DataFrame(sorted_coefs, columns=sorted_metabolites))
+plt.xticks(rotation=90)
+plt.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+plt.ylabel('Coefficient value')
+plt.title("Bootstrap coefficient distributions – tTau (sorted by contribution)")
+plt.tight_layout()
+plt.show()
+```
+
+### Prediction scores for tTau across bootstraps
+
+```{python}
+# plot the prediction scores of all 1000 bootstrap runs
+plt.figure(figsize=(7,5))
+sns.histplot(bootstrap_ttau['r2_sample'], bins=20)
+plt.title("Bootstrap distribution of R² – tTau model\nR² CV: {:.3f}".format(bootstrap_ttau['r2_cv']))
+plt.xlabel("R²")
+plt.show()
+
+print("Mean R²:", np.mean(bootstrap_ttau['r2_sample']))
+print("SD R²:", np.std(bootstrap_ttau['r2_sample']))
+
+results_ttau.to_csv(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_ttau_selection_frequencies.csv")), index=False)
+np.save(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_ttau_coefs.npy")), bootstrap_ttau['coef_matrix'])
+```
+
+
+```{python}
+y_ttau = df['TAU']
+# tTau Prediction intervals (95% CI) for each sample
+pred_lower = np.percentile(bootstrap_ttau['pred_matrix'], 2.5, axis=0)
+pred_upper = np.percentile(bootstrap_ttau['pred_matrix'], 97.5, axis=0)
+pred_mean = bootstrap_ttau['pred_matrix'].mean(axis=0)
+
+# Plot: Which samples have high prediction uncertainty?
+plt.figure(figsize=(10, 5))
+plt.scatter(y_ttau, pred_mean, c=bootstrap_ttau['prediction_sd'], cmap='viridis', alpha=0.6)
+plt.colorbar(label='Prediction SD')
+
+# Add perfect prediction line
+min_val = min(y_ttau.min(), pred_mean.min())
+max_val = max(y_ttau.max(), pred_mean.max())
+plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect prediction', linewidth=2)
+
+plt.xlabel('True tTau')
+plt.ylabel('Predicted tTau (mean)')
+plt.title('Prediction Uncertainty Across Samples for the tTau bootstrap model')
+
+# Stats box
+stats_text = f'N = {len(y_ttau)}\nR² = {np.mean(bootstrap_ttau['r2_sample']):.2f}\nR² (CV) = {bootstrap_ttau['r2_cv']:.2f}'
+plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
+        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+        fontsize=10)
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+
+
+## pTau prediction
+Metabolites stability (selection frequency) and mean contribution coefficients table:
+```{python}
+res_path = os.path.abspath(os.path.join(os.getcwd(), models_dir, 'bootstrap_PTAU.pkl'))
+bootstrap_ptau = pd.read_pickle(res_path)
+
+# Summarize selection frequencies
+results_ptau = pd.DataFrame({
+    'metabolite': bootstrap_ptau['metabolites'],
+    'selection_frequency': bootstrap_ptau['selection_freq'],
+    'mean_coef': bootstrap_ptau['coef_matrix'].mean(axis=0),
+    'coef_lower_95': np.percentile(bootstrap_ptau['coef_matrix'], 2.5, axis=0),
+    'coef_upper_95': np.percentile(bootstrap_ptau['coef_matrix'], 97.5, axis=0)
+}).sort_values('selection_frequency', ascending=False)
+
+print(results_ptau)
+```
+
+Histogram of frequency selection:
+
+```{python}
+# plot stability
+plt.figure(figsize=(8,6))
+sns.histplot(bootstrap_ptau['selection_freq'], bins=20)
+plt.title("Distribution of selection frequencies (pTau)")
+plt.xlabel("Selection frequency")
+plt.show()
+```
+
+### Stable metabolites
+As defined by frequency of selection >70%
+
+
+```{python}
+stable_ptau = results_ptau[results_ptau.selection_frequency > 0.70]
+stable_ptau
+```
+
+Contributions to the model - some statistics on the bootstraps
+```{python}
+mean_coefs = bootstrap_ptau['coef_matrix'].mean(axis=0)
+# Sort metabolites by absolute mean coefficient (descending)
+sorted_idx = np.argsort(np.abs(mean_coefs))[::-1]
+sorted_metabolites = [bootstrap_ptau['metabolites'][i] for i in sorted_idx]
+sorted_coefs = bootstrap_ptau['coef_matrix'][:, sorted_idx]
+# print(sorted_coefs)
+# print(sorted_metabolites)
+
+
+# plot the general contribution
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=pd.DataFrame(sorted_coefs, columns=sorted_metabolites))
+plt.xticks(rotation=90)
+plt.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+plt.ylabel('Coefficient value')
+plt.title("Bootstrap coefficient distributions – pTau (sorted by contribution)")
+plt.tight_layout()
+plt.show()
+```
+
+### Prediction scores for pTau across bootstraps
+
+```{python}
+# plot the prediction scores of all 1000 bootstrap runs
+plt.figure(figsize=(7,5))
+sns.histplot(bootstrap_ptau['r2_sample'], bins=20)
+plt.title("Bootstrap distribution of R² – pTau model\nR² CV: {:.3f}".format(bootstrap_ptau['r2_cv']))
+plt.xlabel("R²")
+plt.show()
+
+print("Mean R²:", np.mean(bootstrap_ptau['r2_sample']))
+print("SD R²:", np.std(bootstrap_ptau['r2_sample']))
+
+results_ptau.to_csv(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_ptau_selection_frequencies.csv")), index=False)
+np.save(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_ptau_coefs.npy")), bootstrap_ptau['coef_matrix'])
+```
+
+
+```{python}
+y_ptau = df['PTAU']
+# pTau Prediction intervals (95% CI) for each sample
+pred_lower = np.percentile(bootstrap_ptau['pred_matrix'], 2.5, axis=0)
+pred_upper = np.percentile(bootstrap_ptau['pred_matrix'], 97.5, axis=0)
+pred_mean = bootstrap_ptau['pred_matrix'].mean(axis=0)
+
+# Plot: Which samples have high prediction uncertainty?
+plt.figure(figsize=(10, 5))
+plt.scatter(y_ptau, pred_mean, c=bootstrap_ptau['prediction_sd'], cmap='viridis', alpha=0.6)
+plt.colorbar(label='Prediction SD')
+
+# Add perfect prediction line
+min_val = min(y_ptau.min(), pred_mean.min())
+max_val = max(y_ptau.max(), pred_mean.max())
+plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect prediction', linewidth=2)
+
+plt.xlabel('True pTau')
+plt.ylabel('Predicted pTau (mean)')
+plt.title('Prediction Uncertainty Across Samples for the pTau bootstrap model')
+
+# Stats box
+stats_text = f'N = {len(y_ptau)}\nR² = {np.mean(bootstrap_ptau['r2_sample']):.2f}\nR² (CV) = {bootstrap_ptau['r2_cv']:.2f}'
+plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
+        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+        fontsize=10)
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+
+## Aβ42 prediction
+Metabolites stability (selection frequency) and mean contribution coefficients table:
+```{python}
+res_path = os.path.abspath(os.path.join(os.getcwd(), models_dir, 'bootstrap_ABETA42.pkl'))
+bootstrap_ab42 = pd.read_pickle(res_path)
+
+# Summarize selection frequencies
+results_ab42 = pd.DataFrame({
+    'metabolite': bootstrap_ab42['metabolites'],
+    'selection_frequency': bootstrap_ab42['selection_freq'],
+    'mean_coef': bootstrap_ab42['coef_matrix'].mean(axis=0),
+    'coef_lower_95': np.percentile(bootstrap_ab42['coef_matrix'], 2.5, axis=0),
+    'coef_upper_95': np.percentile(bootstrap_ab42['coef_matrix'], 97.5, axis=0)
+}).sort_values('selection_frequency', ascending=False)
+
+print(results_ab42)
+```
+
+Histogram of frequency selection:
+
+```{python}
+# plot stability
+plt.figure(figsize=(8,6))
+sns.histplot(bootstrap_ab42['selection_freq'], bins=20)
+plt.title("Distribution of selection frequencies (Aβ42)")
+plt.xlabel("Selection frequency")
+plt.show()
+```
+
+### Stable metabolites
+As defined by frequency of selection >70%
+
+
+```{python}
+stable_ab42 = results_ab42[results_ab42.selection_frequency > 0.70]
+stable_ab42
+```
+
+Contributions to the model - some statistics on the bootstraps
+```{python}
+mean_coefs = bootstrap_ab42['coef_matrix'].mean(axis=0)
+# Sort metabolites by absolute mean coefficient (descending)
+sorted_idx = np.argsort(np.abs(mean_coefs))[::-1]
+sorted_metabolites = [bootstrap_ab42['metabolites'][i] for i in sorted_idx]
+sorted_coefs = bootstrap_ab42['coef_matrix'][:, sorted_idx]
+# print(sorted_coefs)
+# print(sorted_metabolites)
+
+
+# plot the general contribution
+plt.figure(figsize=(12, 6))
+sns.boxplot(data=pd.DataFrame(sorted_coefs, columns=sorted_metabolites))
+plt.xticks(rotation=90)
+plt.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+plt.ylabel('Coefficient value')
+plt.title("Bootstrap coefficient distributions – Aβ42 (sorted by contribution)")
+plt.tight_layout()
+plt.show()
+```
+
+### Prediction scores for Aβ42 across bootstraps
+
+```{python}
+# plot the prediction scores of all 1000 bootstrap runs
+plt.figure(figsize=(7,5))
+sns.histplot(bootstrap_ab42['r2_sample'], bins=20)
+plt.title("Bootstrap distribution of R² – Aβ42 model\nR² CV: {:.3f}".format(bootstrap_ab42['r2_cv']))
+plt.xlabel("R²")
+plt.show()
+
+print("Mean R²:", np.mean(bootstrap_ab42['r2_sample']))
+print("SD R²:", np.std(bootstrap_ab42['r2_sample']))
+
+results_ab42.to_csv(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_AB42_selection_frequencies.csv")), index=False)
+np.save(os.path.abspath(os.path.join(os.getcwd(), models_dir, "bootstrap_AB42_coefs.npy")), bootstrap_ab42['coef_matrix'])
+```
+
+
+```{python}
+y_ab42 = df['ABETA42']
+# Aβ42 Prediction intervals (95% CI) for each sample
+pred_lower = np.percentile(bootstrap_ab42['pred_matrix'], 2.5, axis=0)
+pred_upper = np.percentile(bootstrap_ab42['pred_matrix'], 97.5, axis=0)
+pred_mean = bootstrap_ab42['pred_matrix'].mean(axis=0)
+
+# Plot: Which samples have high prediction uncertainty?
+plt.figure(figsize=(10, 5))
+plt.scatter(y_ab42, pred_mean, c=bootstrap_ab42['prediction_sd'], cmap='viridis', alpha=0.6)
+plt.colorbar(label='Prediction SD')
+
+# Add perfect prediction line
+min_val = min(y_ab42.min(), pred_mean.min())
+max_val = max(y_ab42.max(), pred_mean.max())
+plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect prediction', linewidth=2)
+
+plt.xlabel('True Aβ42')
+plt.ylabel('Predicted Aβ42 (mean)')
+plt.title('Prediction Uncertainty Across Samples for the Aβ42 bootstrap model')
+
+# Stats box
+stats_text = f'N = {len(y_ab42)}\nR² = {np.mean(bootstrap_ab42['r2_sample']):.2f}\nR² (CV) = {bootstrap_ab42['r2_cv']:.2f}'
+plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, 
+        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+        fontsize=10)
+
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+:::
+
+# Summary results
+
+```{python}
+# prepare summary table for all three outcomes for plotting
+stable_mets_plot = pd.concat([
+    stable_ttau[['metabolite']],
+    stable_ptau[['metabolite']],
+    stable_ab42[['metabolite']]
+]).drop_duplicates().reset_index(drop=True)
+
+# Extract coefficients for stable metabolites across all three biomarkers
+coefs_ttau_stable = bootstrap_ttau['coef_matrix'][:, [metabolites.index(m) for m in stable_mets_plot['metabolite']]]
+coefs_ptau_stable = bootstrap_ptau['coef_matrix'][:, [metabolites.index(m) for m in stable_mets_plot['metabolite']]]
+coefs_ab42_stable = bootstrap_ab42['coef_matrix'][:, [metabolites.index(m) for m in stable_mets_plot['metabolite']]]
+
+# Combine into a single dataframe for visualization
+coefs_data = []
+for i, met in enumerate(stable_mets_plot['metabolite']):
+    for b in range(len(bootstrap_ttau['coef_matrix'])):
+        coefs_data.append({'metabolite': met, 'tTau': coefs_ttau_stable[b, i], 'pTau': coefs_ptau_stable[b, i], 'Aβ42': coefs_ab42_stable[b, i]})
+
+coefs_df = pd.DataFrame(coefs_data)
+
+```
+
+
+```{python}
+
+# Add a column for metabolite categories/groups (manual dictionary mapping)
+metabolite_names = {
+    'L.....Arabitol': 'L-(-)-Arabitol',
+    'd.Galactose': 'd-Galactose',
+    'D.Threitol': 'D-Threitol',
+    'Ribonic.acid': 'Ribonic Acid',
+    'd.Glucose': 'd-Glucose',
+    'gluc.erythitol': 'd-Glucose / Erythritol',
+    'L.Threonic.acid': 'L-Threonic Acid',
+    'X3.Deoxy.erythro.pentitol': '3-Deoxy-Erythro-Pentitol',
+    'D.....Ribofuranose': 'D-(-)-Ribofuranose',
+    'D.....Xylose': 'D-(-)-Xylose',
+    'Sorbitol': 'Sorbitol'
+}
+
+coefs_df['metabolite_names'] = coefs_df['metabolite'].map(metabolite_names)
+# print(coefs_df)
+```
+
+
+```{python}
+# Create visualization with metabolites on x-axis and biomarkers side-by-side
+fig, ax = plt.subplots(figsize=(14, 6))
+
+mets = stable_mets_plot['metabolite'].values
+biomarkers = ['tTau', 'pTau', 'Aβ42']
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+stable_dfs = [stable_ttau, stable_ptau, stable_ab42]
+
+x = np.arange(len(mets))
+width = 0.25
+
+for idx, biomarker in enumerate(biomarkers):
+    positions = x + idx * width
+    
+    for i, met in enumerate(mets):
+        data = coefs_df[coefs_df['metabolite'] == met][biomarker].values
+        pos = positions[i]
+        
+        # Determine alpha based on whether metabolite is stable for this biomarker
+        alpha = 1.0 if met in stable_dfs[idx]['metabolite'].values else 0.25
+        
+        bp = ax.boxplot([data], positions=[pos], widths=width*0.8, patch_artist=True,
+                       boxprops=dict(facecolor=colors[idx], alpha=alpha),
+                       medianprops=dict(color='black', linewidth=1.5))
+
+ax.set_xlabel('Metabolite', fontsize=12)
+ax.set_ylabel('Coefficient Value', fontsize=12)
+ax.set_title('Bootstrap Coefficient Distributions - Stable Metabolites Across Biomarkers', fontsize=13)
+ax.set_xticks(x + width)
+
+# Get the mapped names for x-axis labels
+met_names = [coefs_df[coefs_df['metabolite'] == m]['metabolite_names'].iloc[0] for m in mets]
+ax.set_xticklabels(met_names, rotation=45, ha='right')
+ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+
+# Create custom legend
+legend_elements = [Patch(facecolor=colors[i], alpha=1.0, label=biomarkers[i]) for i in range(len(biomarkers))]
+ax.legend(handles=legend_elements)
+
+plt.tight_layout()
+res_path = os.path.abspath(os.path.join(os.getcwd(), models_dir, 'StableMetabolites_boxplots.png'))
+plt.savefig(res_path, dpi=300, bbox_inches='tight')
+print('\Real vs predicted models saved as "StableMetabolites_boxplots.png"')
+plt.show()
+
+```
+
+
+```{python}
+# Create a 3-panel plot
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# Define your three variables
+variables = [
+    {'y_true': df['TAU'], 'bootstrap': bootstrap_ttau, 'name': 'tTau'},{'y_true': df['PTAU'], 'bootstrap': bootstrap_ptau, 'name': 'pTau'},
+    {'y_true': df['ABETA42'], 'bootstrap': bootstrap_ab42, 'name': 'Aβ42'}
+]
+
+for idx, var in enumerate(variables):
+    plt.sca(axes[idx])  # Set current axis
+    
+    # Calculate predictions
+    pred_mean = var['bootstrap']['pred_matrix'].mean(axis=0)
+    
+    # Scatter plot
+    scatter = axes[idx].scatter(var['y_true'], pred_mean, 
+                                c=var['bootstrap']['prediction_sd'], 
+                                cmap='viridis', alpha=0.6)
+    plt.colorbar(scatter, ax=axes[idx], label='Prediction SD')
+    
+    # Perfect prediction line
+    min_val = min(var['y_true'].min(), pred_mean.min())
+    max_val = max(var['y_true'].max(), pred_mean.max())
+    axes[idx].plot([min_val, max_val], [min_val, max_val], 'r--', 
+                   label='Perfect prediction', linewidth=2)
+    
+    axes[idx].set_xlabel(f'True {var["name"]}')
+    axes[idx].set_ylabel(f'Predicted {var["name"]} (mean)')
+    axes[idx].set_title(f'{var["name"]} Bootstrap Model')
+    
+    # Stats box
+    stats_text = f'N = {len(var["y_true"])}\nR² = {np.mean(var["bootstrap"]["r2_sample"]):.2f}\nR² (CV) = {var["bootstrap"]["r2_cv"]:.2f}'
+    axes[idx].text(0.05, 0.95, stats_text, transform=axes[idx].transAxes, 
+                   verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                   fontsize=9)
+    
+    axes[idx].legend()
+    axes[idx].grid(True, alpha=0.3)
+
+plt.tight_layout()
+res_path = os.path.abspath(os.path.join(os.getcwd(), models_dir, 'PredictedvsReal_allpanels_bootstrap.png'))
+plt.savefig(res_path, dpi=300, bbox_inches='tight')
+print('\Real vs predicted models saved as "PredictedvsReal_allpanels_bootstrap.png"')
+plt.show()
+```

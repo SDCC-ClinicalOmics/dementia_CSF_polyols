@@ -1,0 +1,1052 @@
+---
+title: "Lundbeck project - Targeted CSF CGMS metabolomics - Rigshospitalet - Univariate analysis"
+author: "Marc Clos-Garcia"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: united
+    self_contained: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo = FALSE}
+# Suppress progress bar output globally
+knitr::opts_chunk$set(progress = FALSE)
+
+## libraries
+library(here)
+library(tidyverse)
+library(ggrepel)
+library(glmnet)
+library(broom)
+library(pROC)
+library(caret)
+library(htmlwidgets)
+library(DT)
+library(knitr)
+library(DALEX)
+library(shapviz)
+library(ggbeeswarm)
+
+## directories
+dir_data <- here("data/CSF")
+if (!dir.exists(dir_data)) dir.create(dir_data)
+dir_res <- here("results/CSF")
+if (!dir.exists(dir_res)) dir.create(dir_res)
+dir_code <- here("code")
+if (!dir.exists(dir_code)) dir.create(dir_code)
+
+## Set cores
+max_cores <- if (Sys.getenv("_R_CHECK_LIMIT_CORES_") != "") 2 else parallel::detectCores() - 1
+# Setup the parallel backend with the appropriate number of workers
+BPPARAM <- BiocParallel::SnowParam(workers = max_cores)
+
+# Define the JS rowCallback function as a string
+rowCallback <- "
+  function(row, data, index) {
+    // Example: color every even row
+    if (index % 2 === 0) {
+      $(row).css('background-color', '#f2f2f2');
+    }
+  }
+"
+```
+
+```{r functions, echo=FALSE, message=FALSE, warning=FALSE}
+## T-test analysis
+ttest_analysis <- function(metabolites, metadata, contrast) {
+    output_dataframe <- data.frame(
+        "mean_diff" = c(),
+        "fold_change" = c(),
+        "p_value" = c()
+    )
+
+    metadata.reduced <- metadata %>% dplyr::filter(fullClass %in% contrast)
+    metabolites.reduced <- metabolites[row.names(metabolites) %in% metadata.reduced$sample, ]
+
+    if (!identical(as.character(row.names(metabolites.reduced)), as.character(metadata.reduced$sample))) {
+        metadata.reduced <- metadata.reduced[match(row.names(metabolites.reduced), metadata.reduced$sample), ]
+    } else {}
+
+    for (metabolite in colnames(metabolites.reduced)) {
+        tmp_df <- cbind(metabolites.reduced, "class" = metadata.reduced$fullClass)
+        tmp_results <- t.test(tmp_df[[metabolite]] ~ tmp_df[["class"]])
+        tmp_mean_diff <- 10^tmp_results$estimate[[1]] - 10^tmp_results$estimate[[2]]
+        tmp_fold_change <- 10^(tmp_results$estimate[[1]] - tmp_results$estimate[[2]])
+        tmp_pval <- tmp_results$p.value
+        output_dataframe[metabolite, "mean_diff"] <- tmp_mean_diff
+        output_dataframe[metabolite, "fold_change"] <- tmp_fold_change
+        output_dataframe[metabolite, "p_value"] <- tmp_pval
+    }
+    output_dataframe$Metabolite <- rownames(output_dataframe)
+    output_dataframe$log2FC <- log2(output_dataframe$fold_change)
+    output_dataframe$FDR <- p.adjust(output_dataframe$p_value, method = "fdr")
+    output_dataframe <- output_dataframe[, c("Metabolite", "mean_diff", "fold_change", "log2FC", "p_value", "FDR")]
+    return(output_dataframe)
+}
+
+## GLM models
+glm_analysis <- function(metabolites, metadata, contrast) {
+    output_dataframe <- data.frame(
+        "mean_diff" = c(),
+        "fold_change" = c(),
+        "p_value" = c()
+    )
+
+    metadata.reduced <- metadata %>% dplyr::filter(fullClass %in% contrast)
+    metabolites.reduced <- metabolites[row.names(metabolites) %in% metadata.reduced$sample, ]
+
+    if (!identical(as.character(row.names(metabolites.reduced)), as.character(metadata.reduced$sample))) {
+        metadata.reduced <- metadata.reduced[match(row.names(metabolites.reduced), metadata.reduced$sample), ]
+    } else {}
+
+    for (metabolite in colnames(metabolites.reduced)) {
+        tmp_df <- cbind(metabolites.reduced, "class" = metadata.reduced$fullClass,  "Age" = metadata.reduced$AgeAtVisit, 
+                        "Gender" = metadata.reduced$Gender, "Statins" = metadata.reduced$Statins)
+        tmp_results <- glm(tmp_df[["class"]] ~ 1 + tmp_df[[metabolite]] + tmp_df[["Age"]] + tmp_df[["Gender"]] + tmp_df[["Statins"]], data = tmp_df, binomial(link="logit"))
+        tmp_results_s <- summary(tmp_results)
+        output_dataframe[metabolite, "estimate"] <- tmp_results$coefficients[2]
+        output_dataframe[metabolite, "se"] <- tmp_results_s$coefficients[2, 2]
+        output_dataframe[metabolite, "p_value"] <- tmp_results_s$coefficients[2, 4]
+    }
+    output_dataframe$Metabolite <- rownames(output_dataframe)
+    output_dataframe$FDR <- p.adjust(output_dataframe$p_value, method = "fdr")
+    output_dataframe$odds_ratio <- exp(output_dataframe$estimate)
+    output_dataframe$lower_ci <- exp(output_dataframe$estimate - 1.96 * output_dataframe$se) # 1,96 for 95% CI
+    output_dataframe$upper_ci <- exp(output_dataframe$estimate + 1.96 * output_dataframe$se)
+
+    output_dataframe <- output_dataframe[, c(
+        "Metabolite", "estimate", "se", "p_value", "FDR", "odds_ratio",
+        "lower_ci", "upper_ci"
+    )]
+
+    return(output_dataframe)
+}
+
+
+## LASSO models
+lasso_analysis <- function(metabolites, metadata, contrast) {
+    metadata.reduced <- metadata %>% dplyr::filter(fullClass %in% contrast)
+    metabolites.reduced <- metabolites[row.names(metabolites) %in% metadata.reduced$sample, ]
+
+    if (!identical(as.character(row.names(metabolites.reduced)), as.character(metadata.reduced$sample))) {
+        metadata.reduced <- metadata.reduced[match(row.names(metabolites.reduced), metadata.reduced$sample), ]
+    } else {}
+
+    # ---- STEP 1: Prepare data ----
+    # "class" must be 0/1 (numeric or factor)
+    # "metabolite_columns" contains all metabolite names
+    X <- as.matrix(metabolites.reduced) # predictor matrix
+    y <- as.character(metadata.reduced$fullClass) # outcome (binary)
+    y <- match(y, unique(y)) - 1 # convert to 0/1 for LASSO modelling
+
+    # ---- STEP 2: LASSO with cross-validation ----
+    set.seed(sample(seq(100, 999), 1)) # for reproducibility
+    cvfit <- cv.glmnet(X, y, family = "binomial", alpha = 1, type.measure = "deviance")
+    lambda_min <- cvfit$lambda.min
+
+    coef_lasso <- coef(cvfit, s = lambda_min)
+    selected_vars <- rownames(coef_lasso)[as.numeric(coef_lasso) != 0]
+    selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+
+    cat("Selected metabolites:\n")
+    print(selected_vars)
+
+    if (length(selected_vars) > 0) {
+        # ---- STEP 3: Refit GLM ----
+        tmp_df <- cbind(metabolites.reduced, "class" = metadata.reduced$fullClass)
+        formula <- as.formula(paste("class ~", paste(selected_vars, collapse = " + ")))
+        final_glm <- glm(formula, data = tmp_df, family = binomial)
+
+        results <- tidy(final_glm) %>%
+            mutate(
+                odds_ratio = exp(estimate),
+                conf.low = exp(estimate - 1.96 * std.error),
+                conf.high = exp(estimate + 1.96 * std.error)
+            )
+
+        # ---- STEP 4: Cross-validated AUC ----
+        set.seed(sample(seq(100, 999), 1))
+        tmp_df$class <- droplevels(tmp_df$class)
+        folds <- createFolds(tmp_df$class, k = 5, returnTrain = TRUE)
+
+        # Precompute test indices and a per-row fold id (for within-test-fold permutation)
+        n <- nrow(tmp_df)
+        all_idx <- seq_len(n)
+        test_idx_list <- lapply(folds, function(tr) setdiff(all_idx, tr))
+
+        fold_id <- integer(n)
+        for (j in seq_along(test_idx_list)) {
+            fold_id[test_idx_list[[j]]] <- j
+        }
+        split_idx <- split(all_idx, fold_id) # rows belonging to each test fold
+
+        cv_auc <- function(data, formula, folds) {
+            auc_results <- list()
+            aucs <- numeric(length(folds))
+            for (j in seq_along(folds)) {
+                train_idx <- folds[[j]]
+                test_idx <- setdiff(seq_len(nrow(data)), train_idx)
+
+                train_data <- data[train_idx, ]
+                test_data <- data[test_idx, ]
+
+                fit <- glm(formula, data = train_data, family = binomial)
+                preds <- predict(fit, newdata = test_data, type = "response")
+
+                ytest <- droplevels(test_data$class)
+                if (length(unique(ytest)) < 2L) {
+                    # Degenerate test set — should not happen with within-fold permutation,
+                    # but we guard anyway.
+                    aucs[j] <- NA_real_
+                } else {
+                    # You can add `positive = "<case_label>"` if you want to be explicit
+                    roc_obj <- pROC::roc(response = ytest, predictor = preds, quiet = TRUE)
+                    aucs[j] <- as.numeric(pROC::auc(roc_obj))
+                    auc_results[[j]] <- data.frame(sensitivity = roc_obj$sensitivities, specificity = roc_obj$specificities, fdr = 1 - roc_obj$specificities)
+                }
+            }
+            mean_aucs <- mean(aucs, na.rm = TRUE)
+            return(list("aucs" = aucs, "mean_auc" = mean_aucs, "aucs_values" = auc_results))
+        }
+
+        observed_auc <- cv_auc(tmp_df, formula, folds)
+        cat("Observed mean CV AUC:", observed_auc$mean_auc, "\n")
+
+        # ---- STEP 5: Permutation Test ----
+        set.seed(sample(seq(100, 999), 1))
+        n_perm <- 1000
+        perm_aucs <- list()
+
+        for (i in seq_len(n_perm)) {
+            df_perm <- tmp_df
+            # KEY: permute labels *within each test fold* to preserve per-fold class balance
+            for (idx in split_idx) {
+                df_perm$class[idx] <- sample(df_perm$class[idx])
+            }
+            perm_aucs[[i]] <- cv_auc(df_perm, formula, folds)
+        }
+
+        # Unbiased permutation p-value
+        perm_aucs_mean <- lapply(perm_aucs, function(x) {
+            x$mean_auc
+        })
+        perm_p_value <- (1 + sum(perm_aucs_mean >= observed_auc$mean_auc, na.rm = TRUE)) / (1 + n_perm)
+        cat("Permutation p-value:", perm_p_value, "\n")
+
+        # ---- STEP 6: ROC Curve (final model) ----
+        full_preds <- predict(final_glm, type = "response")
+        # If you want an explicit positive class, set positive = "CaseLabel"
+        full_roc <- roc(tmp_df$class, full_preds, quiet = TRUE)
+        #  plot(full_roc, main = paste0("ROC Curve (AUC = ", round(auc(full_roc), 3), ")"))
+
+        if (length(selected_vars) > 1) {
+            # ---- STEP 6: Shapley scores/plot ----
+            # Convert class to 0/1 (numeric)
+            y_numeric <- as.numeric(tmp_df$class) - 1
+            # Prepare explainer
+            explainer <- explain(
+                model = final_glm,
+                data = tmp_df[, selected_vars],
+                y = y_numeric,
+                label = "GLM Model"
+            )
+
+            # Compute SHAP values for multiple rows
+            # This loops over each row and collects SHAP values
+            shap_list <- lapply(1:nrow(tmp_df), function(i) {
+                parts <- predict_parts(explainer, new_observation = tmp_df[i, selected_vars], type = "shap", B = 10)
+                # Extract SHAP values and reorder by variable
+                shap_values <- setNames(parts$contribution, parts$variable_name)
+                shap_values[selected_vars] # Ensure consistent ordering
+            })
+            shap_df <- do.call(rbind, shap_list)
+            # Combine all into one shapviz object
+            sv <- shapviz(shap_df, X = tmp_df[, selected_vars])
+
+
+            # ---- STEP 7: save output ----
+            output <- list(
+                "Selected_metabolites" = results,
+                "Observed_AUCs" = observed_auc,
+                "Permutation_AUCs" = perm_aucs,
+                "Permutation_pval" = perm_p_value,
+                "Final_model" = full_roc,
+                "SHAP_values" = shap_df,
+                "SHAP_viz" = sv
+            )
+        } else {
+            # ---- STEP 7: save output ----
+            output <- list(
+                "Selected_metabolites" = results,
+                "Observed_AUCs" = observed_auc,
+                "Permutation_AUCs" = perm_aucs,
+                "Permutation_pval" = perm_p_value,
+                "Final_model" = full_roc,
+                "SHAP_values" = NA,
+                "SHAP_viz" = NA
+            )
+        }
+    } else {
+        cat("No metabolites selected at lambda.min.\n")
+        output <- list(
+            "Selected_metabolites" = NA,
+            "Observed_AUCs" = NA,
+            "Permutation_AUCs" = NA,
+            "Permutation_pval" = NA,
+            "Final_model" = NA,
+            "SHAP_values" = NA,
+            "SHAP_viz" = NA
+        )
+    }
+
+
+    return(output)
+}
+```
+
+
+```{r load data, echo=FALSE, message=FALSE, warning=FALSE}
+cohort <- read.table(file.path(dir_data, "CSF_targeted_logtransformed.txt"), sep = "\t", header = T)
+
+## correct fullClass cohort
+cohort$fullClass <- gsub("No cognitive impairment", "HC", cohort$fullClass)
+cohort$fullClass <- factor(cohort$fullClass, levels = c("HC", "MCI_Non-AD", "MCI", "AD", "VaD"))
+
+
+## split between metadata and metabolomics data
+metadata <- cohort[, 1:23]
+row.names(metadata) <- cohort$sample
+metabolites <- cohort[, 24:ncol(cohort)]
+row.names(metabolites) <- cohort$sample
+
+
+## set up color key
+color_key <- list(fullClass = c(
+    "HC" = "skyblue2",
+    "MCI_Non-AD" = "darkolivegreen3",
+    "MCI" = "goldenrod1",
+    "AD" = "salmon",
+    "VaD" = "darkred"
+))
+
+## define contrasts and comparisons
+contrasts <- levels(cohort$fullClass)
+comparisons <- list(
+    "HC" = list(
+        c("HC", "MCI_Non-AD"), c("HC", "MCI"), c("HC", "AD"), c("HC", "VaD")
+    ),
+    "MCI_Non-AD" = list(
+        c("MCI_Non-AD", "MCI"), c("MCI_Non-AD", "AD"), c("MCI_Non-AD", "VaD")
+    ),
+    "MCI" = list(
+        c("MCI", "AD"), c("MCI", "VaD")
+    ),
+    "AD" = list(
+        c("AD", "VaD")
+    )
+)
+```
+
+
+# Context
+t-test
+linear/logistic models
+RandomForest?
+
+# T-test analysis {.tabset}
+```{r ttest run, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+ttest_results <- lapply(comparisons, function(contrast) {
+    results <- lapply(contrast, function(comparison) {
+        res <- ttest_analysis(metabolites, metadata, comparison)
+        return(res)
+    })
+    names(results) <- unlist(lapply(contrast, function(x) {
+        paste(x, collapse = "vs")
+    }))
+    combined_results <- do.call(rbind, Map(function(df, name) {
+        df$source <- name
+        df
+    }, results, names(results)))
+
+    return(combined_results)
+})
+
+ttest_results <- do.call(rbind, ttest_results)
+ttest_results <- ttest_results |> dplyr::select(source, Metabolite, everything())
+
+
+for (comp in names(comparisons)) {
+    comp.list <- comparisons[[comp]]
+    for (subc in comp.list) {
+        cat("## ", paste(subc, collapse = "vs"), "\n\n")
+        ttest_specific <- ttest_results |> dplyr::filter(source == paste(subc, collapse = "vs"))
+        raw.p <- ggplot(ttest_specific, aes(log2FC, -log10(p_value))) +
+            geom_point() +
+            geom_text_repel(
+                data = subset(ttest_specific, p_value <= 0.05),
+                aes(label = Metabolite)
+            ) +
+            geom_hline(yintercept = -log10(0.05)) +
+            theme_bw() +
+            labs(
+                x = bquote(~ log[2] ~ "Fold-Change"),
+                y = bquote("-" ~ log[10] ~ "pvalue")
+            ) +
+            labs(title = paste(subc, collapse = "vs"))
+        fdr.p <- ggplot(ttest_specific, aes(log2FC, -log10(FDR))) +
+            geom_point() +
+            geom_text_repel(
+                data = subset(ttest_specific, FDR <= 0.05),
+                aes(label = Metabolite)
+            ) +
+            geom_hline(yintercept = -log10(0.05)) +
+            theme_bw() +
+            labs(
+                x = bquote(~ log[2] ~ "Fold-Change"),
+                y = bquote("-" ~ log[10] ~ "FDR")
+            ) +
+            labs(title = paste(subc, collapse = "vs"))
+        print(ggpubr::ggarrange(raw.p, fdr.p))
+        cat("\n\n")
+        ttest_specific <- ttest_specific |>
+            arrange(p_value) |>
+            mutate_if(is.numeric, round, 3)
+        cat(knitr::knit_print(DT::datatable(ttest_specific,
+            escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+            options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+        )))
+    }
+}
+```
+
+# Logistic regression models {.tabset}
+```{r logistic models, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+glm_results <- lapply(comparisons, function(contrast) {
+    results <- lapply(contrast, function(comparison) {
+        res <- glm_analysis(metabolites, metadata, comparison)
+        return(res)
+    })
+    names(results) <- unlist(lapply(contrast, function(x) {
+        paste(x, collapse = "vs")
+    }))
+    combined_results <- do.call(rbind, Map(function(df, name) {
+        df$source <- name
+        df
+    }, results, names(results)))
+
+    return(combined_results)
+})
+```
+
+
+```{r glm show, echo=FALSE, message=FALSE, warning=FALSE, eval=TRUE, results = "asis", fig.width=6, fig.height=4}
+## show results
+for (n in names(glm_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- glm_results[[n]]
+    df_list <- list()
+    for (contrast in unique(df$source)) {
+        cat("### ", contrast, "\n\n")
+        df_red <- df[df$source == contrast, ]
+        df_red$source <- NULL
+        df_red <- df_red |>
+            dplyr::mutate_if(is.numeric, round, 2) |>
+            as.data.frame()
+        cat(knitr::knit_print(DT::datatable(df_red,
+            escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+            options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+        )))
+        cat("\n\n")
+        df_red <- df_red[df_red$p_value <= 0.05, ]
+        if (nrow(df_red) > 0) {
+            forest_plot <- df_red |>
+                dplyr::mutate(significance = case_when(
+                    p_value <= 0.05 ~ "*",
+                    p_value <= 0.01 ~ "**",
+                    p_value <= 0.001 ~ "***",
+                    TRUE ~ ""
+                )) |>
+                ggplot(aes(odds_ratio, Metabolite)) +
+                geom_point() +
+                geom_errorbar(aes(xmin = lower_ci, xmax = upper_ci), width = 0.15) +
+                geom_vline(xintercept = 1, linetype = "dashed") +
+                geom_text(aes(x = max(upper_ci, na.rm = T) + 0.25, label = significance),
+                    vjust = .75,
+                    size = 8, # Size of stars
+                    na.rm = TRUE
+                ) +
+                ylab("Odds Ratio (95% CI)") +
+                xlab("") +
+                theme_minimal() +
+                theme(
+                    axis.line = element_line(),
+                    strip.background = element_rect(),
+                    panel.background = element_rect()
+                )
+            print(forest_plot)
+            cat("\n\n")
+        } else {
+            NULL
+        }
+    }
+}
+```
+
+
+
+# LASSO regression
+We noticed that the SE of the metabolites in the logistic models are disproportionaly high, which is a sign of low signal or not enough power in the analyzed dataset.
+We decided to try with more complex models, i.e. LASSO regression approaches, that will combine all relevant metabolites in a single model. It will also allow us to identify the higher contributing metabolites.
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+lasso_results <- lapply(comparisons, function(contrast) {
+    results <- lapply(contrast, function(comparison) {
+        res <- lasso_analysis(metabolites, metadata, comparison)
+        return(res)
+    })
+    names(results) <- unlist(lapply(contrast, function(x) {
+        paste(x, collapse = "vs")
+    }))
+    combined_results <- do.call(rbind, Map(function(df, name) {
+        df$source <- name
+        df
+    }, results, names(results)))
+
+    return(combined_results)
+})
+```
+
+## AUCs {.tabset}
+```{r AUC boxplots, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+for (n in names(lasso_results)) {
+    cat("### ", n, " {.tabset} \n\n")
+    lasso.df <- lasso_results[[n]]
+    for (contrast in rownames(lasso.df)) {
+        cat("#### ", contrast, "\n\n")
+        lasso.df2 <- lasso.df[contrast, ]
+        if (is.null(ncol(lasso.df2$Selected_metabolites))) {
+            cat("No selected metabolites in the minimal lambda")
+            cat("\n\n")
+        } else {
+            obs_aucs <- lasso.df2$Observed_AUCs$aucs
+            permutation_aucs <- unlist(lapply(lasso.df2$Permutation_AUCs, function(au) {
+                return(au$aucs)
+            }))
+            final_auc <- lasso.df2$Final_model$auc
+            AUCs_plot <- rbind(
+                data.frame(AUC = obs_aucs, source = "Observed_AUC"),
+                data.frame(AUC = permutation_aucs, source = "Permutation_AUC"),
+                data.frame(AUC = final_auc, source = "Final_model_AUC")
+            )
+            AUCs_plot$source <- factor(AUCs_plot$source, levels = c("Final_model_AUC", "Permutation_AUC", "Observed_AUC"))
+            auc_bplot <- ggplot(AUCs_plot, aes(AUC, source)) +
+                ggbeeswarm::geom_quasirandom() +
+                geom_boxplot(alpha = .25) +
+                geom_vline(xintercept = 0.5, color = "darkred") +
+                theme_bw() +
+                xlim(0, 1) +
+                labs(y = "AUC origin", title = contrast)
+            print(auc_bplot)
+            cat("\n\n")
+            sel_mets <- lasso.df2$Selected_metabolites |>
+                dplyr::mutate_if(is.numeric, round, 3) |>
+                as.data.frame()
+
+            cat(knitr::knit_print(DT::datatable(sel_mets,
+                escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+                options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+            )))
+            cat("\n\n")
+            if (!inherits(lasso.df2$SHAP_viz[[1]], "logical")) {
+              shap_plot <- shapviz::sv_importance(lasso.df2$SHAP_viz, kind = "beeswarm") + theme_bw()
+              print(shap_plot)
+              cat("\n\n")
+            }
+            
+        }
+    }
+}
+```
+
+# Regression against continous variables {.tabset}
+```{r  echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+continuous_analysis <- function(metabolites, metadata, variable) {
+    output_dataframe <- data.frame()
+
+    metadata.reduced <- metadata %>% dplyr::filter(!is.na(metadata[[variable]]))
+    metadata.reduced <- metadata.reduced %>% dplyr::filter(metadata.reduced[[variable]] > 1)
+    metabolites.reduced <- metabolites[row.names(metabolites) %in% metadata.reduced$sample, ]
+
+    if (!identical(as.character(row.names(metabolites.reduced)), as.character(metadata.reduced$sample))) {
+        metadata.reduced <- metadata.reduced[match(row.names(metabolites.reduced), metadata.reduced$sample), ]
+    } else {}
+
+    for (metabolite in colnames(metabolites.reduced)) {
+        # numeric_var <- log(metadata.reduced[[variable]])
+        # numeric_var <- scale(numeric_var)
+        numeric_var <- scale(metadata.reduced[[variable]])
+        tmp_df <- cbind(metabolites.reduced, "numeric_var" = numeric_var, Age = metadata.reduced[["AgeAtVisit"]], Gender = metadata.reduced[["Gender"]], statins = metadata.reduced[["Statins"]])
+        tmp_df[[metabolite]] <- scale(tmp_df[[metabolite]], center = TRUE, scale = TRUE)
+
+        tmp_results <- glm(tmp_df[["numeric_var"]] ~ 1 + tmp_df[[metabolite]] + tmp_df[["Age"]] + tmp_df[["Gender"]] + tmp_df[["statins"]], data = tmp_df, family = "gaussian")
+        tmp_results_s <- summary(tmp_results)
+        null_deviance <- tmp_results$null.deviance
+        residual_deviance <- tmp_results$deviance
+        # Calculate R-squared
+        r_squared <- 1 - (residual_deviance / null_deviance)
+        CIs <- confint(tmp_results)
+
+        output_dataframe[metabolite, "r2"] <- r_squared
+        output_dataframe[metabolite, "estimate"] <- tmp_results$coefficients[2]
+        output_dataframe[metabolite, "se"] <- tmp_results_s$coefficients[2, 2]
+        output_dataframe[metabolite, "CI_upper"] <- CIs[2, 2]
+        output_dataframe[metabolite, "CI_lower"] <- CIs[2, 1]
+        output_dataframe[metabolite, "p_value"] <- tmp_results_s$coefficients[2, 4]
+    }
+    output_dataframe$Metabolite <- rownames(output_dataframe)
+    output_dataframe$FDR <- p.adjust(output_dataframe$p_value, method = "fdr")
+
+    output_dataframe <- output_dataframe[, c(
+        "Metabolite", "r2", "estimate", "se", "CI_upper", "CI_lower", "p_value", "FDR"
+    )]
+
+    return(output_dataframe)
+}
+```
+
+
+
+```{r  echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+metadata <- metadata |>
+    dplyr::rename(
+        "betaAmyloid" = "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+        "phosphoTau" = "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+        "totalTau" = "Cerebrospinal.fluids_Total.Tau.pg.ml",
+        ACE_Score = Neuropsychology_ACE_Total.score
+    )
+variables <- c("MMSE_Score", "betaAmyloid", "phosphoTau", "totalTau", "ACE_Score", "BMI", "CSF_glucose")
+```
+
+
+```{r linear models, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+names(linear_results) <- variables
+```
+
+
+```{r linear show, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+## show results
+for (n in names(linear_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- linear_results[[n]]
+    df <- df |>
+        dplyr::mutate_if(is.numeric, round, 2) |>
+        as.data.frame()
+    cat(knitr::knit_print(DT::datatable(df,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    df_red <- df[df$p_value <= 0.05, ]
+    metabolites_plot <- cbind(metadata, metabolites)
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(!is.na(metabolites_plot[[n]]))
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(metabolites_plot[[n]] > 1)
+    metabolites_plot[[n]] <- log(metabolites_plot[[n]])
+    for (met in unique(df_red$Metabolite)) {
+        cat("### ", met, "\n\n")
+        p <- ggplot(metabolites_plot, aes_string(x = n, y = met)) +
+            geom_point() +
+            geom_smooth(method = "lm", se = F) +
+            theme_bw() +
+            labs(
+                x = paste0("log-transformed ", n),
+                y = paste0(met, " normalized abundance")
+            )
+        print(p)
+        cat("\n\n")
+    }
+}
+```
+
+
+# Regression against continous variables - HC+MCI+AD {.tabset}
+
+```{r linear models 2, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+metadata.red <- metadata %>% dplyr::filter(fullClass %in% c("HC", "MCI", "AD"))
+metabolites.red <- metabolites[metadata.red$sample, ]
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+names(linear_results) <- variables
+```
+
+```{r stupidly needed to knit tables3b, echo=FALSE,include = FALSE}
+# You need this code to conduct the magic dependences attaching...
+DT::datatable(matrix())
+```
+
+```{r linear show2, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+## show results
+for (n in names(linear_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- linear_results[[n]]
+    df <- df |>
+        dplyr::mutate_if(is.numeric, round, 2) |>
+        as.data.frame()
+    cat(knitr::knit_print(DT::datatable(df,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    df_red <- df[df$p_value <= 0.05, ]
+    metabolites_plot <- cbind(metadata, metabolites)
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(!is.na(metabolites_plot[[n]]))
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(metabolites_plot[[n]] > 1)
+    metabolites_plot[[n]] <- log(metabolites_plot[[n]])
+    for (met in unique(df_red$Metabolite)) {
+        cat("### ", met, "\n\n")
+        p <- ggplot(metabolites_plot, aes_string(x = n, y = met)) +
+            geom_point() +
+            geom_smooth(method = "lm", se = F) +
+            theme_bw() +
+            labs(
+                x = paste0("log-transformed ", n),
+                y = paste0(met, " normalized abundance")
+            )
+        print(p)
+        cat("\n\n")
+    }
+}
+```
+
+# Regression against continous variables - MCI {.tabset}
+```{r linear models 3, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+metadata.red <- metadata %>% dplyr::filter(fullClass %in% c("MCI"))
+metabolites.red <- metabolites[metadata.red$sample, ]
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+names(linear_results) <- variables
+```
+
+```{r stupidly needed to knit tables3c, echo=FALSE,include = FALSE}
+# You need this code to conduct the magic dependences attaching...
+DT::datatable(matrix())
+```
+
+```{r linear show3, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+## show results
+for (n in names(linear_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- linear_results[[n]]
+    df <- df |>
+        dplyr::mutate_if(is.numeric, round, 2) |>
+        as.data.frame()
+    cat(knitr::knit_print(DT::datatable(df,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    df_red <- df[df$p_value <= 0.05, ]
+    metabolites_plot <- cbind(metadata, metabolites)
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(!is.na(metabolites_plot[[n]]))
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(metabolites_plot[[n]] > 1)
+    metabolites_plot[[n]] <- log(metabolites_plot[[n]])
+    for (met in unique(df_red$Metabolite)) {
+        cat("### ", met, "\n\n")
+        p <- ggplot(metabolites_plot, aes_string(x = n, y = met)) +
+            geom_point() +
+            geom_smooth(method = "lm", se = F) +
+            theme_bw() +
+            labs(
+                x = paste0("log-transformed ", n),
+                y = paste0(met, " normalized abundance")
+            )
+        print(p)
+        cat("\n\n")
+    }
+}
+```
+
+# Regression against continous variables - HC+VaD {.tabset}
+```{r linear models 4, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+metadata.red <- metadata %>% dplyr::filter(fullClass %in% c("HC", "VaD"))
+metabolites.red <- metabolites[metadata.red$sample, ]
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+names(linear_results) <- variables
+```
+
+```{r stupidly needed to knit tables3d, echo=FALSE,include = FALSE}
+# You need this code to conduct the magic dependences attaching...
+DT::datatable(matrix())
+```
+
+```{r linear show4, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+## show results
+for (n in names(linear_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- linear_results[[n]]
+    df <- df |>
+        dplyr::mutate_if(is.numeric, round, 2) |>
+        as.data.frame()
+    cat(knitr::knit_print(DT::datatable(df,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    df_red <- df[df$p_value <= 0.05, ]
+    metabolites_plot <- cbind(metadata, metabolites)
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(!is.na(metabolites_plot[[n]]))
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(metabolites_plot[[n]] > 1)
+    metabolites_plot[[n]] <- log(metabolites_plot[[n]])
+    for (met in unique(df_red$Metabolite)) {
+        cat("### ", met, "\n\n")
+        p <- ggplot(metabolites_plot, aes_string(x = n, y = met)) +
+            geom_point() +
+            geom_smooth(method = "lm", se = F) +
+            theme_bw() +
+            labs(
+                x = paste0("log-transformed ", n),
+                y = paste0(met, " normalized abundance")
+            )
+        print(p)
+        cat("\n\n")
+    }
+}
+```
+
+
+# Regression against continous variables - HC+MCI+AD+VaD {.tabset}
+
+```{r linear model relevantsampless, echo=FALSE, message=FALSE, warning=FALSE, results="asis"}
+metadata.red <- metadata %>% dplyr::filter(fullClass %in% c("HC", "MCI", "AD", "VaD"))
+metabolites.red <- metabolites[metadata.red$sample, ]
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+linear_results <- lapply(variables, function(comparison) {
+    res <- continuous_analysis(metabolites, metadata, comparison)
+    return(res)
+})
+
+names(linear_results) <- variables
+```
+
+```{r stupidly needed to knit tablesfinal, echo=FALSE,include = FALSE}
+# You need this code to conduct the magic dependences attaching...
+DT::datatable(matrix())
+```
+
+```{r linear showntsamples releva, echo=FALSE, message=FALSE, warning=FALSE, results = "asis"}
+## show results
+for (n in names(linear_results)) {
+    cat("## ", n, " {.tabset} \n\n")
+    df <- linear_results[[n]]
+    df <- df |>
+        dplyr::mutate_if(is.numeric, round, 2) |>
+        as.data.frame()
+    cat(knitr::knit_print(DT::datatable(df,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    df_red <- df[df$p_value <= 0.05, ]
+    metabolites_plot <- cbind(metadata, metabolites)
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(!is.na(metabolites_plot[[n]]))
+    metabolites_plot <- metabolites_plot %>% dplyr::filter(metabolites_plot[[n]] > 1)
+    metabolites_plot[[n]] <- log(metabolites_plot[[n]])
+    for (met in unique(df_red$Metabolite)) {
+        cat("### ", met, "\n\n")
+        p <- ggplot(metabolites_plot, aes_string(x = n, y = met)) +
+            geom_point() +
+            geom_smooth(method = "lm", se = F) +
+            theme_bw() +
+            labs(
+                x = paste0("log-transformed ", n),
+                y = paste0(met, " normalized abundance")
+            )
+        print(p)
+        cat("\n\n")
+    }
+}
+```
+
+
+
+
+# Bayesian approach {.tabset}
+```{r, message=FALSE, warning=FALSE, echo=FALSE, results="asis"}
+bayesian_results <- list.files(dir_res, pattern = "^CSF_TARGETED_")
+
+for(b in bayesian_results){
+  bayesian <- read.table(file.path(dir_res, b), header = T, sep = ",")
+  
+  ## prep title
+  comparison <- gsub("CSF_TARGETED_(.*)_bayesian_results\\.csv", "\\1", b)
+  comparison <- gsub("_", "vs", comparison)
+
+  cat("## ", comparison, "\n\n")
+  bayesian$pval <- 1 - pmax(bayesian$p_pos, bayesian$p_neg)
+  bayesian$pval <- ifelse(bayesian$pval == 0, 0.000001, bayesian$pval)
+  volcano <- ggplot(bayesian, aes(x = mean_beta, y = -log10(pval), color = significant)) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    labs(
+      title = paste0("Parallel Bayesian Differential Metabolite Analysis - ", comparison),
+      x = "Posterior Mean Effect (β)",
+      y = "-log10(1 - Posterior Probability)"
+    ) +
+    theme_bw() +
+    geom_text_repel(
+      data = subset(bayesian, (1 - pmax(p_pos, p_neg)) <= 0.05),
+      aes(label = Metabolite)
+    ) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed")
+  print(volcano)
+  cat("\n\n")
+  cat(knitr::knit_print(DT::datatable(bayesian,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+  cat("\n\n")
+}
+
+
+all_bayesian <- lapply(bayesian_results, function(b){
+  df <- read.table(file.path(dir_res, b), header = T, sep = ",")
+  return(df)
+})
+
+names(all_bayesian) <- sapply(bayesian_results, function(b){
+  comparison <- gsub("CSF_(.*)_bayesian_results\\.csv", "\\1", b)
+  comparison <- gsub("_", "vs", comparison)
+})
+
+all_bayesian <- do.call(rbind, all_bayesian) %>% 
+  tibble::rownames_to_column("source") %>% 
+  tidyr::separate(source, sep = "\\.", into = "source") %>% 
+  as.data.frame()
+
+```
+
+
+
+# Results coherence {.tabset}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, results="asis"}
+library(UpSetR)
+library(ComplexHeatmap)
+
+comparisons <- list("HC_MCI" = "HCvsMCI",
+                    "HC_AD" = "HCvsAD", 
+                    "HC_VaD" = "HCvsVaD")
+
+diff_mets_list <- list()
+for(comp in comparisons){
+  cat("##", comp, "\n\n")
+  
+  bayesian <- all_bayesian %>% dplyr::mutate(source = gsub("TARGETEDvs", "", source)) %>% dplyr::filter(source == comp)
+  bayesian$pval <- 1 - pmax(bayesian$p_pos, bayesian$p_neg)
+  bayesian$pval <- ifelse(bayesian$pval == 0, 0.000001, bayesian$pval)
+  
+  
+  diff.exp.mets <- list(
+    "ttest" = ttest_results %>% dplyr::filter(source == comp) %>% dplyr::filter(p_value <= 0.05) %>% pull(Metabolite),
+    "GLM" = glm_results$HC %>% dplyr::filter(source == comp) %>% dplyr::filter(p_value <= 0.05) %>%  pull(Metabolite),
+    "Lasso" = as.data.frame(lasso_results$HC[comp, "Selected_metabolites"])$term[-1],
+    "Bayesian" = bayesian %>% dplyr::filter(pval <= 0.05) %>% pull(Metabolite),
+    "GLM_betaAmyloid" = linear_results$betaAmyloid %>% dplyr::filter(p_value <= 0.05) %>% pull(Metabolite),
+    "GLM_pTau" = linear_results$phosphoTau %>% dplyr::filter(p_value <= 0.05) %>% pull(Metabolite),
+    "GLM_tTau" = linear_results$totalTau %>% dplyr::filter(p_value <= 0.05) %>% pull(Metabolite)
+  )
+  
+  up_plot <- upset(fromList(diff.exp.mets), nintersects = NA, nsets = length(names(diff.exp.mets)))
+  print(up_plot)
+  cat("\n\n")
+  
+  diff.exp.mets.m <- ComplexHeatmap::list_to_matrix(diff.exp.mets) %>%  as.data.frame()
+  diff.exp.mets.m[] <- as.data.frame(sapply(diff.exp.mets.m, as.integer))  
+  diff.exp.mets.m <- diff.exp.mets.m %>% 
+    dplyr::mutate(TOTAL = rowSums(.)) %>% 
+    dplyr::arrange(-TOTAL) %>% 
+    tibble::rownames_to_column("Metabolite") 
+  
+  diff_mets_list[[comp]] <- diff.exp.mets.m
+  
+  cat(knitr::knit_print(DT::datatable(diff.exp.mets.m,
+        escape = T, height = "100%", class = "cell-border stripe", rownames = FALSE,
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+
+  cat("\n\n")
+}
+
+```
+
+
+
+# Boxplots of identified differential metabolites {.tabset}
+```{r echo=FALSE, results='asis'}
+library(ggpubr)
+
+
+for(comp in comparisons){
+  cat("##", comp, " {.tabset} \n\n")
+  
+  mets.plot <- diff_mets_list[[comp]] %>% 
+    dplyr::filter(TOTAL > 1) %>% 
+    pull(Metabolite)
+  
+  comp_plot <- unlist(strsplit(comp, split = "vs"))
+
+  for(m in mets.plot){
+    df <- cbind(metadata, metabolite = metabolites[[m]])
+    df <- df[df$fullClass %in% comp_plot, ]
+    bplots <- ggplot(df, aes(fullClass, metabolite)) +
+      geom_boxplot() +
+      geom_quasirandom(alpha = .25) +
+      stat_compare_means() +
+      labs(x = "Clinical group",
+           y = paste0("Normalized ", m, " abundance"),
+           title = comp) +
+      theme_bw()
+    
+    cat("### ", m, "\n\n")
+    print(bplots)
+    cat("\n\n")
+  }
+  
+  bayesian <- all_bayesian %>% dplyr::mutate(source = gsub("TARGETEDvs", "", source)) %>% dplyr::filter(source == comp) 
+  bayesian$pval <- 1 - pmax(bayesian$p_pos, bayesian$p_neg)
+  bayesian$pval <- ifelse(bayesian$pval == 0, 0.000001, bayesian$pval)
+  
+  mets.plot <- bayesian %>%
+    dplyr::filter(source == comp) %>% 
+    dplyr::filter(Metabolite %in% mets.plot) %>% 
+    dplyr::select(Metabolite, mean_beta, pval)
+
+
+  # write.table(mets.plot, file.path(dir_res, paste0("Coherence_CSF_TARGETED_", comp, "_relevanthits.txt")), sep = "\t", row.names = F)
+}
+```
+
+# {.unlisted .unnumbered}
+
+```{r, echo=FALSE}
+pander::pander(sessionInfo())
+```

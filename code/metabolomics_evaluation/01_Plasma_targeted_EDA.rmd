@@ -1,0 +1,406 @@
+---
+title: "Lundbeck project - Targeted Plasma CGMS metabolomics - Rigshospitalet - EDA"
+author: "Marc Clos-Garcia"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: united
+date: "`r Sys.Date()`"
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo = FALSE}
+## libraries
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(factoextra)
+library(VIM)
+library(PCAtools)
+library(ropls)
+library(DT)
+library(gridExtra)
+library(MASS)
+library(ggfortify)
+library(DescTools)
+library(tableone)
+library(variancePartition)
+library(ggbeeswarm)
+library(ggridges)
+library(ggExtra)
+
+## directories
+dir_data <- here("data/Plasma")
+if (!dir.exists(dir_data)) dir.create(dir_data)
+dir_res <- here("results/Plasma")
+if (!dir.exists(dir_res)) dir.create(dir_res)
+dir_code <- here("code")
+if (!dir.exists(dir_code)) dir.create(dir_code)
+```
+
+```{r load data, echo=FALSE, message=FALSE, warning=FALSE}
+cohort <- read.table(file.path(dir_data, "Plasma_targeted_logtransformed.txt"), sep = "\t", header = T)
+
+## correct fullClass cohort
+cohort$fullClass <- factor(cohort$fullClass, levels = c("HC", "MCI_Non-AD", "MCI", "AD", "VaD"))
+
+## split between metadata and metabolomics data
+metadata <- cohort[, 1:23]
+row.names(metadata) <- metadata$sample
+metabolites <- cohort[, 24:ncol(cohort)]
+row.names(metabolites) <- metadata$sample
+
+
+## set up color key
+color_key <- list(fullClass = c(
+    "HC" = "skyblue2",
+    "MCI_Non-AD" = "darkolivegreen3",
+    "MCI" = "goldenrod1",
+    "AD" = "salmon",
+    "VaD" = "darkred"
+))
+```
+
+# Context
+In the Exploratory Data Analysis (EDA), we will evaluate the distribution of the samples and their relationship with metadata, including the identification of potential confounding factors in the available metadata.
+
+# Cohort
+```{r metadata diff, echo=FALSE, message=FALSE, warning=FALSE}
+## Vector of variables to summarize
+vars_test <- c(
+    "Gender", "AgeAtVisit", "CognitiveSyndrome", "Diagnosis", "MMSE_Score", "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml", "Cerebrospinal.fluids_Total.Tau.pg.ml", "BMI", "Statins",
+    "Hormone replacement therapy", "Neuropsychology_ACE_Total score", "Genetics_Risk factors_APOE", "CSF_glucose"  
+)
+## Vector of categorical variables that need transformation
+catVars <- c("Gender", "CognitiveSyndrome", "Diagnosis")
+
+tab3 <- CreateTableOne(vars = vars_test, strata = "fullClass", data = metadata, factorVars = catVars)
+
+tab_df <- print(tab3, printToggle = FALSE, noSpaces = TRUE)
+tab_df <- tab_df[, -ncol(tab_df)]
+DT::datatable(tab_df, options = list(
+    scrollX = TRUE,
+    pageLength = nrow(tab_df), # or -1 to display all rows if you're using lengthMenu
+    lengthMenu = list(c(-1, 10, 25, 50), c("All", "10", "25", "50"))
+), class = "cell-border stripe")
+```
+
+
+# Metadata evaluation
+```{r values distribution, echo=FALSE, message=FALSE, warning=FALSE}
+metadata.plot <- metadata |>
+    dplyr::rename(
+        "betaAmyloid" = "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+        "phosphoTau" = "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+        "totalTau" = "Cerebrospinal.fluids_Total.Tau.pg.ml"
+    )
+variables <- c("MMSE_Score", "betaAmyloid", "phosphoTau", "totalTau")
+
+metadata.plot <- metadata.plot |> dplyr::select(sample, fullClass, all_of(variables))
+metadata.plot.m <- reshape2::melt(metadata.plot, id.vars = c("sample", "fullClass"))
+metadata.plot.sum <- metadata.plot.m %>%
+    group_by(fullClass, variable) %>%
+    summarise(median_value = median(value, na.rm = TRUE))
+
+ggplot(metadata.plot.m, aes(y = fullClass, x = value, color = fullClass, fill = fullClass)) +
+    geom_density_ridges(alpha = .25) +
+    facet_wrap(~variable, scales = "free") +
+    scale_fill_manual(values = color_key$fullClass) +
+    scale_color_manual(values = color_key$fullClass) +
+    theme_bw()
+```
+
+
+```{r identify outliers, echo=FALSE, message=FALSE, warning=FALSE}
+## individuals with values <1
+metadata.plot |>
+    dplyr::filter(totalTau < 1 | phosphoTau < 1) |>
+    DT::datatable(rownames = F)
+ind.remove <- metadata.plot |>
+    dplyr::filter(totalTau < 1 | phosphoTau < 1) |>
+    pull(sample)
+metadata.plot <- metadata.plot |>
+    dplyr::filter(!sample %in% ind.remove)
+```
+
+```{r bxplots metadata without outliers, echo=FALSE, message=FALSE, warning=FALSE}
+metadata.plot.m <- reshape2::melt(metadata.plot, id.vars = c("sample", "fullClass"))
+metadata.plot.sum <- metadata.plot.m %>%
+    group_by(fullClass, variable) %>%
+    summarise(median_value = median(value, na.rm = TRUE))
+
+ggplot(metadata.plot.m, aes(fullClass, value, color = fullClass, fill = fullClass)) +
+    geom_violin(alpha = .25) +
+    geom_quasirandom() +
+    scale_color_manual(values = color_key$fullClass) +
+    scale_fill_manual(values = color_key$fullClass) +
+    facet_wrap(~variable, scales = "free") +
+    geom_point(
+        data = metadata.plot.sum, aes(x = fullClass, y = median_value, group = 1),
+        color = "black", size = 2
+    ) +
+    geom_line(
+        data = metadata.plot.sum, aes(x = fullClass, y = median_value, group = 1),
+        color = "black", linetype = "dashed"
+    ) +
+    theme_bw()
+```
+
+
+
+```{r tau vs amyloid, echo=FALSE, message=FALSE, warning=FALSE}
+gp <- ggplot(metadata.plot, aes(betaAmyloid, totalTau, color = fullClass, label = sample)) +
+    geom_point() +
+    theme_bw()
+
+ggMarginal(gp, groupColour = TRUE, groupFill = TRUE)
+```
+
+
+# PCA analysis - samples vs metadata {.tabset}
+After the data normalization and outlier removal, we generated a PCA with the filtered dataset. We see that PC1 and PC2 accounts for a bit less than 50% of the variance of the dataset, slowly increasing with the remaining PCs.
+
+```{r main PCA, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 10, fig.height=5}
+pca.targeted <- pca(as.data.frame(t(metabolites)), metadata = metadata)
+screeplot(pca.targeted, components = 1:25)
+```
+
+```{r pcatools biplot, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=9}
+bplot <- biplot(pca.targeted,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+```
+
+The scores plot don't show any specific clustering of the samples according to the clinical groups, when evaluated all together. We decide to investigate if any of the available metadata is correlated with the PCs identified.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, , fig.width=8, fig.height=8.5}
+plot_legend <- get_legend(bplot)
+pplot <- pairsplot(pca.targeted, colby = "fullClass", colkey = color_key$fullClass)
+print(cowplot::plot_grid(pplot, plot_legend, nrow = 2, rel_heights = c(1.9, 0.1)))
+```
+
+Note that the correlations between the PCs and the metadata did not display any significant association with the cilnical category (*fullClass*), while both the gender and age showed significant correlations with several PCs.
+
+```{r pcatools with numerical metadata, echo=FALSE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+metadata.num <- metadata %>%
+    dplyr::mutate(Gender = ifelse(Gender == "Female", 1, 2)) %>%
+    dplyr::mutate(CognitiveSyndrome = case_when(
+        CognitiveSyndrome == "No cognitive impairment" ~ 0,
+        CognitiveSyndrome == "Significantly impaired" ~ 1,
+        CognitiveSyndrome == "Mild dementia" ~ 2,
+        CognitiveSyndrome == "Moderate dementia" ~ 3,
+        CognitiveSyndrome == "Severe dementia" ~ 4
+    )) %>%
+    dplyr::mutate(fullClass = case_when(
+        fullClass == "No cognitive impairment" ~ 0,
+        fullClass == "MCI_Non-AD" ~ 1,
+        fullClass == "MCI" ~ 2,
+        fullClass == "AD" ~ 3,
+        fullClass == "VaD" ~ 4
+    ))  %>%
+    dplyr::mutate(Genetics_Risk.factors_APOE = case_when(
+        Genetics_Risk.factors_APOE == "E3/E3" ~ 0,
+        Genetics_Risk.factors_APOE == "E3/E4" ~ 1,
+        Genetics_Risk.factors_APOE == "E4/E4" ~ 2
+    )) %>%
+    dplyr::select(
+        sample, Gender, AgeAtVisit, BMI, CognitiveSyndrome, fullClass, MMSE_Score,
+        Cerebrospinal.fluids_Amyloid.beta.42.pg.ml, Cerebrospinal.fluids_Phospho.Tau.pg.ml,
+        Cerebrospinal.fluids_Total.Tau.pg.ml, Statins, Hormone.replacement.therapy, Neuropsychology_ACE_Total.score,
+        Genetics_Risk.factors_APOE, CSF_glucose
+    )
+
+pca.targeted <- PCAtools::pca(as.data.frame(t(metabolites)), metadata = metadata.num, center = TRUE, scale = TRUE)
+
+eigencorplot(pca.targeted, metavars = c(
+    "Gender", "AgeAtVisit", "BMI", "CognitiveSyndrome", "fullClass",
+    "MMSE_Score", "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+    "Cerebrospinal.fluids_Total.Tau.pg.ml", "Statins", "Hormone.replacement.therapy",
+    "Neuropsychology_ACE_Total.score", "Genetics_Risk.factors_APOE", "CSF_glucose"
+))
+```
+
+Seeing the associations observed between the available metadata and the generated PCs, we decide to generate one scores plot per metadata variable, in order to see if we identify any variable driving the samples disposition in the PCAs.
+
+```{r pcas-metadata-variables, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=9.5, results='asis'}
+variables <- c(
+    "Gender", "AgeAtVisit", "CognitiveSyndrome", "Diagnosis", "Class", "MMSE_Score",
+    "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml", "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+    "Cerebrospinal.fluids_Total.Tau.pg.ml", "BMI", "Statins", "Hormone.replacement.therapy",
+    "Neuropsychology_ACE_Total.score", "Genetics_Risk.factors_APOE","CSF_glucose" 
+)
+pca.metadata <- PCAtools::pca(as.data.frame(t(metabolites)), metadata = metadata, center = TRUE, scale = TRUE)
+
+for (v in variables) {
+    cat("## ", v, "\n\n")
+    if (is.numeric(metadata[[v]]) == TRUE) {
+        bp <- biplot(pca.metadata,
+            colby = v,
+            encircleAlpha = 0.15,
+            legendPosition = "bottom",
+            lab = NULL
+        )
+    } else {
+        bp <- biplot(pca.metadata,
+            colby = v,
+            encircle = T,
+            encircleAlpha = 0.15,
+            legendPosition = "bottom",
+            lab = NULL
+        )
+    }
+    print(bp)
+    cat("\n\n")
+}
+```
+
+
+# Variance partition evaluation {.tabset}
+Since no clear clusters are observed in the PCAs when coloring by the different available metadata, we move forward to evaluate the relationship between the available metadata and the variance explained by each factor. 
+By doing this for the whole dataset, we see that practically all variance is explained by the residuals of the full model, with only a very small percentage of variance being related to the clinical category.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+formula <- paste(
+    "~ fullClass", "Gender",
+    "AgeAtVisit", "MMSE_Score",
+    "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+    "Cerebrospinal.fluids_Total.Tau.pg.ml",
+    "BMI", "Statins", "Hormone.replacement.therapy", "CSF_glucose",
+    sep = " + "
+)
+
+vp <- fitExtractVarPartModel(
+    as.data.frame(t(metabolites)),
+    formula,
+    metadata
+)
+plotVarPart(vp)
+```
+
+Doing the same analysis but by each pairwise comparison across the 5 clinical groups (HC, MCI (noAD), MCI, AD and VaD), we see the same results as above.
+
+```{r variance per contrast, results="asis", echo=FALSE, message=FALSE, warning=FALSE}
+comparisons <- list(
+    c("HC", "MCI_Non-AD"),
+    c("HC", "MCI"),
+    c("HC", "AD"),
+    c("HC", "VaD"),
+    c("MCI_Non-AD", "MCI"),
+    c("MCI_Non-AD", "AD"),
+    c("MCI_Non-AD", "VaD"),
+    c("MCI", "AD"),
+    c("MCI", "VaD"),
+    c("AD", "VaD")
+)
+
+for (comp in comparisons) {
+    cat("## ", paste(comp, collapse = " vs "), "\n\n")
+    metadata.red <- metadata %>% dplyr::filter(fullClass %in% comp)
+    metabs.red <- metabolites[row.names(metabolites) %in% metadata.red$sample, ]
+    vp <- fitExtractVarPartModel(
+        as.data.frame(t(metabs.red)),
+        formula,
+        metadata.red
+    )
+
+    print(plotVarPart(vp))
+    cat("\n\n")
+}
+```
+
+# Regress out the identified metadata features
+```{r regress out gender and age, echo=FALSE, message=FALSE, warning=FALSE}
+#### there's significant correlation with Gender at PC1, let's try regressing it
+metabolites.gender <- sapply(metabolites, function(var) {
+    res <- residuals(lm(var ~ metadata$Gender + metadata$AgeAtVisit))
+    return(res)
+})
+row.names(metabolites.gender) <- row.names(metabolites)
+
+metabolites.gender.out <- cbind(metadata, metabolites.gender)
+write.table(metabolites.gender.out, file.path(dir_data, "Plasma_targeted_genderAgeremoved.txt"), sep = "\t", row.names = F)
+```
+
+We repeat the PCA analysis with the dataset after removal of gender and age effects.
+```{r main PCA - no gender - no age, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 10, fig.height=5}
+pca.noagenogender <- pca(as.data.frame(t(metabolites.gender)), metadata = metadata)
+```
+
+```{r pcatools biplot - no gender - no age, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=9}
+bplot <- biplot(pca.noagenogender,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+```
+
+We see that now, effectively, there are no associations between gender and age with any PC.
+```{r pcatools with numerical metadata - no gender - no age, echo=FALSE, message=FALSE, warning=FALSE, fig.width=12, fig.height=8}
+pca.noagenogender <- PCAtools::pca(as.data.frame(t(metabolites.gender)), metadata = metadata.num, center = TRUE, scale = TRUE)
+
+eigencorplot(pca.noagenogender, metavars = c(
+    "Gender", "AgeAtVisit", "BMI", "CognitiveSyndrome", "fullClass",
+    "MMSE_Score", "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml",
+    "Cerebrospinal.fluids_Total.Tau.pg.ml",
+    "Statins", "Hormone.replacement.therapy",
+    "Neuropsychology_ACE_Total.score", "Genetics_Risk.factors_APOE", "CSF_glucose"
+))
+```
+
+
+
+
+# Paired PCAs {.tabset}
+```{r echo=FALSE, message=FALSE, warning=FALSE, results = "asis", fig.width=5, fig.height=5.5}
+comparisons <- list(
+    c("HC", "MCI_Non-AD"),
+    c("HC", "MCI"),
+    c("HC", "AD"),
+    c("HC", "VaD"),
+    c("MCI_Non-AD", "MCI"),
+    c("MCI_Non-AD", "AD"),
+    c("MCI_Non-AD", "VaD"),
+    c("MCI", "AD"),
+    c("MCI", "VaD"),
+    c("AD", "VaD")
+)
+
+for(comp in comparisons){
+  cat("## ", paste(comp, collapse = "_vs_"), "\n\n")
+  metadata.red <- metadata %>% dplyr::filter(fullClass %in% comp)
+  rownames(metadata.red) <- metadata.red$sample
+  metabs.red <- metabolites[row.names(metabolites) %in% metadata.red$sample, ]
+  # identical(rownames(metabs.red), rownames(metadata.red))
+  pca.red <- PCAtools::pca(as.data.frame(t(metabs.red)), metadata = metadata.red)
+  bplot <- biplot(pca.red,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+  )
+  print(bplot)
+  cat("\n\n")
+}
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+pander::pander(sessionInfo())
+```
+
+

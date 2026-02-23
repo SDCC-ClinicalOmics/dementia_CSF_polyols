@@ -1,0 +1,1020 @@
+---
+title: "Lundbeck project - Unmetabs Plasma CGMS metabolomics - Rigshospitalet - QC"
+author: "Marc Clos-Garcia"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: united
+date: "`r Sys.Date()`"
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo = FALSE}
+## libraries
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(factoextra)
+library(VIM)
+library(PCAtools)
+library(ropls)
+library(DT)
+library(gridExtra)
+library(MASS)
+library(ggfortify)
+library(DescTools)
+library(crmn)
+
+## directories
+dir_data <- here("data/Plasma")
+if (!dir.exists(dir_data)) dir.create(dir_data)
+dir_res <- here("results/Plasma")
+if (!dir.exists(dir_res)) dir.create(dir_res)
+dir_code <- here("code")
+if (!dir.exists(dir_code)) dir.create(dir_code)
+
+color_key <- list(fullClass = c(
+    "HC" = "skyblue2",
+    "MCI_Non-AD" = "darkolivegreen3",
+    "MCI" = "goldenrod1",
+    "AD" = "salmon",
+    "VaD" = "darkred",
+    "technical_blank" = "pink",
+    "technical_CP" = "magenta",
+    "technical_RPO" = "darkmagenta"
+))
+```
+
+```{r load and format datasets, echo=FALSE, message=FALSE, warning=FALSE}
+#### GC-MS
+metabs <- read.table(file.path(dir_data, "Area_0_20231051348.txt"), header = T, sep = "\t", skip = 4)
+
+#### create peak column
+metabs$peak <- paste0("MSpeak_", seq_len(nrow(metabs))) ## create a vector for row.names to keep an annotation object apart
+metabs <- metabs %>% dplyr::select(peak, everything()) ## put the naming vector first
+
+#### extract annotation and abundance matrices
+met_annotation <- metabs[, 1:27]
+metabs <- metabs[, c(1, 30:ncol(metabs))]
+
+## transpose and convert to DF
+row.names(metabs) <- metabs$peak
+metabs$peak <- NULL
+metabs <- as.data.frame(t(metabs))
+
+###### extract sample numbers
+row.names(metabs) <- gsub("_backup", "", row.names(metabs))
+
+metabs <- metabs %>%
+    tibble::rownames_to_column("Data File") %>%
+    tidyr::separate("Data File", sep = "_", into = c("P_number", "P_name", "Date", "Run", "sample", "vial", "injection"), remove = FALSE) %>%
+    dplyr::mutate(sample = ifelse(is.na(sample), `Data File`, sample)) %>%
+    dplyr::select(-P_number, -P_name, -Date, -vial, -injection) %>%
+    as.data.frame()
+
+# write.table(met_annotation, file.path(dir_data, "mets_annotationfile.txt"), sep = "\t")
+
+#### clinical - sample IDs
+mtdt <- read.delim(file.path(dir_data, "Sample codenumbers plus data 2023_01_03_KH.csv"), header = T, sep = ",")
+
+#### IDs matching file
+matching <- read.table(file.path(dir_data, "0111_Lundbeck_QQQ_plasma_STENO_ID_DDBBno_each_sample.csv"), header = T, sep = ",", skip = 1)
+matching <- matching[, -3]
+```
+
+
+```{r add DDBBno ids to metadata and merge all files, echo=FALSE, message=FALSE, warning=FALSE}
+#### add ID to metadata
+mtdt <- mtdt %>%
+    dplyr::left_join(matching, by = "DDBBno") %>%
+    dplyr::select(STENO.ID, DDBBno, everything())
+mtdt$STENO.ID <- as.character(mtdt$STENO.ID)
+
+#### add extra metadata
+extra_metadata <- readxl::read_excel(file.path(dir_data, "RH_Clinical info BMI_Statin_HRT_2025_06_23.xlsx"), sheet = 1, col_names = T)
+extra_metadata <- extra_metadata %>% dplyr::select(DDBBno, BMI, Statins, "Hormone replacement therapy", `Neuropsychology_ACE_Total score`, `Genetics_Risk factors_APOE`, CSF_glucose = "Cerebrospinal fluids_Glucose#mmol/l")
+
+mtdt <- mtdt %>% 
+  dplyr::left_join(extra_metadata, by = "DDBBno") %>% 
+  dplyr::mutate(Statins = ifelse(Statins == "Nej", 0, 1)) %>% 
+  dplyr::mutate("Hormone replacement therapy" = ifelse(`Hormone replacement therapy` == "Nej", 0, 1))
+
+#### merge metabolomics with metadata
+metabs <- metabs %>%
+    dplyr::left_join(mtdt, by = c("sample" = "STENO.ID")) %>%
+    dplyr::select(
+        Name = `Data File`, sample, DDBBno, Gender, AgeAtVisit, CognitiveSyndrome,
+        Diagnosis, Class, MMSE_Score, Cerebrospinal.fluids_Amyloid.beta.42.pg.ml,
+        Cerebrospinal.fluids_Phospho.Tau.pg.ml, Cerebrospinal.fluids_Total.Tau.pg.ml, BMI, 
+        Statins, "Hormone replacement therapy", "Neuropsychology_ACE_Total score", 
+        "Genetics_Risk factors_APOE", CSF_glucose, everything())
+
+## clean up
+rm(matching)
+```
+
+
+```{r data transformations, echo=FALSE, message=FALSE, warning=FALSE}
+## data transformations
+### transform to numbers
+metabs[, 20:ncol(metabs)] <- sapply(metabs[, 20:ncol(metabs)], as.numeric) ## convert to numeric
+```
+
+# Context
+In this report, we perform a quality-control evaluation of the metabs metabolomics dataset. In total, the dataset included up to `r ncol(metabs[, 17:ncol(metabs)])` annotated metabs metabolites. The process presented here includes:
+
+* Evaluating the ratios between blanks and samples
+* Evaluation of Coefficient of Variation (CV) in the sample pools
+* Identification and processing of duplicate samples
+* Missing values evaluation and imputation
+* Data normalization
+* Identification and removal of outliers
+
+
+## How many annotated and unannotated peaks?
+```{r evaluate annotated, echo=FALSE, warning=FALSE, message=FALSE}
+annot_summary <- as.data.frame(table(ifelse(met_annotation$Metabolite.name == "Unknown", "Unannotated", "Annotated")))
+annot_summary %>%
+    dplyr::select(Classification = Var1, n = Freq) %>%
+    dplyr::mutate(percentage = (n / sum(n) * 100)) %>%
+    dplyr::mutate_if(is.numeric, round, 2) %>%
+    DT::datatable(.)
+```
+
+In total, we see `r annot_summary[1, 2]` annotated metabolites and `r annot_summary[2, 2]`
+
+# Results {.tabset}
+
+## Annotated peaks
+```{r keep annotated mets, echo=FALSE, message=FALSE, warning=FALSE}
+# filter out unannotated peaks from annotation file
+annotated_mets <- met_annotation[met_annotation$Metabolite.name != "Unknown", ]
+
+# keep only annotated metabolites
+metabs.annot <- metabs[, names(metabs) %in% annotated_mets$peak]
+metabs <- cbind(metabs[, 1:19], metabs.annot)
+```
+
+
+### Check blanks vs other samples metabolites
+Looking at the metabolite average abundance per sample type, we see that only 4 metabolites not being present in blanks: *linoleic acid, oleic acid, stearic acid* and *threonine*.
+
+Ideally, we would like to keep only those metabolites not present in the blank samples or, at least, present in 3x times in the samples than in the blanks. 
+
+```{r average abundance comparison -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+blanks <- metabs %>% dplyr::filter(grepl("blank", sample))
+RPO <- metabs %>% dplyr::filter(grepl("RPO", sample))
+CP <- metabs %>% dplyr::filter(grepl("CP", sample))
+
+samples <- metabs %>% dplyr::filter(!(sample %in% c(blanks$sample, RPO$sample, CP$sample)))
+
+## compute mean values per metabolite
+blanks.avg <- sapply(blanks[, 20:ncol(blanks)], median, na.rm = T)
+samples.avg <- sapply(samples[, 20:ncol(samples)], median, na.rm = T)
+RPO.avg <- sapply(RPO[, 20:ncol(RPO)], median, na.rm = T)
+CP.avg <- sapply(CP[, 20:ncol(CP)], median, na.rm = T)
+
+avg.abundance <- data.frame(
+    "blanks" = blanks.avg,
+    "RPO" = RPO.avg,
+    "CP" = CP.avg,
+    "samples" = samples.avg
+)
+
+avg.abundance %>%
+    tibble::rownames_to_column("metabolite") %>%
+    reshape2::melt() %>%
+    ggplot(aes(metabolite, log10(value), group = variable, fill = variable)) +
+    geom_col(position = position_dodge()) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5))
+
+avg.abundance %>%
+    tibble::rownames_to_column("metabolite") %>%
+    reshape2::melt() %>%
+    dplyr::filter(metabolite %in% sample(unique(metabolite), 15)) %>% 
+    ggplot(aes(metabolite, log10(value), group = variable, fill = variable)) +
+    geom_col(position = position_dodge()) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5))
+```
+
+```{r FC blanks-samples, echo=FALSE, message=FALSE, warning=FALSE, fig.height=10}
+
+FC_peaks <- as.data.frame(sapply(samples[, 20:ncol(samples)], median, na.rm=T)/sapply(blanks[, 20:ncol(samples)], median, na.rm=T)) %>% 
+  tibble::rownames_to_column("peak") 
+names(FC_peaks) <- c("peak", "FC")  
+FC_peaks$color <- ifelse(log2(FC_peaks$FC)>0, "black", "red")
+ggplot(FC_peaks, aes(log2(FC), reorder(peak, FC), fill = color)) + geom_col() + 
+  geom_vline(xintercept = 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) +
+  scale_fill_manual(values=c("black", "darkred")) +
+  guides(fill=F)
+
+# FC_peaks %>% 
+#   mutate(log2FC = log2(FC)) %>% 
+#   dplyr::filter(log2FC > 1)
+
+metabs.remove <- FC_peaks %>% 
+  mutate(log2FC = log2(FC)) %>% 
+  dplyr::filter(log2FC < 0)
+
+
+standards <- met_annotation[grepl("Steno", met_annotation$Metabolite.name), ]$peak
+metabs.remove <- metabs.remove %>% dplyr::filter(!peak %in% standards)
+
+metabs <- metabs[, !names(metabs) %in% metabs.remove$peak]
+```
+
+
+```{r subtract blanks -carryover- from areas}
+mspeak_cols <- grep("^MSpeak_", names(metabs), value = TRUE)
+blanks.avg <- blanks.avg[names(blanks.avg) %in% mspeak_cols]
+
+metabs.subtracted <- metabs
+metabs.subtracted[, mspeak_cols] <- 
+  sweep(metabs[, mspeak_cols], 2, blanks.avg, FUN = "-")
+
+metabs.subtracted[metabs.subtracted < 0] <- NA
+
+metabs <- metabs.subtracted
+```
+
+### Look at pooled samples - RPO
+If we evaluate the Coefficient of Variation (CV) for the Real Pool (RPO) samples, we only identify *cysteine* as having a large CV (>30%), which would result in its removal from the analyses.
+
+```{r CV RPO -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+# RPO %>%
+#     dplyr::select(Run, row.names(avg.abundance)) %>%
+#     reshape2::melt() %>%
+#     ggplot(aes(variable, log10(value))) +
+#     geom_boxplot()
+
+
+cv <- function(x) {
+    cv <- sd(x) / abs(mean(x)) * 100
+    return(cv)
+}
+
+cv.rpo <- sapply(RPO[, row.names(avg.abundance)], cv)
+cv.rpo <- data.frame(Metabolite = names(cv.rpo), CV = cv.rpo)
+cv.rpo <- cv.rpo %>%
+    arrange(CV) %>%
+    dplyr::mutate(Metabolite = factor(Metabolite, levels = Metabolite))
+ggplot(cv.rpo, aes(CV, Metabolite)) +
+    geom_col() +
+    geom_vline(xintercept = 30, color = "red") +
+    labs(
+        title = "RPO pools Coefficient of Variation",
+        x = "Coefficient of Variation (%)"
+    )
+```
+
+### Look at pooled samples - CP
+If we evaluate the Coefficient of Variation (CV) for the Clinical Pool (CP) samples, we see up to 4 metabolites: *cysteine, stearic acid, arachidonic acid* and *alpha ketoglutarate* as having a large CV (>30%), which would result in their removal from the analyses.
+
+```{r CV CP -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+# CP %>%
+#     dplyr::select(Run, row.names(avg.abundance)) %>%
+#     reshape2::melt() %>%
+#     ggplot(aes(variable, log10(value))) +
+#     geom_boxplot()
+
+
+cv.cp <- sapply(CP[, row.names(avg.abundance)], cv)
+cv.cp <- data.frame(Metabolite = names(cv.cp), CV = cv.cp)
+cv.cp <- cv.cp %>%
+    arrange(CV) %>%
+    dplyr::mutate(Metabolite = factor(Metabolite, levels = Metabolite))
+ggplot(cv.cp, aes(CV, Metabolite)) +
+    geom_col() +
+    geom_vline(xintercept = 30, color = "red") +
+    labs(
+        title = "CP pools Coefficient of Variation",
+        x = "Coefficient of Variation (%)"
+    )
+```
+
+
+### Check for duplicates {.tabset}
+```{r duplicates -annotated-, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+# sort(table(metabs$sample), decreasing = TRUE) ## we check duplicates by sample name, no duplicates are observed except for blank17, CP17 and RPO17
+
+# Check missing patterns to see if any of them has more missing data
+# This is also a type of QCing the data to check how well duplicates correlate
+dups.df <- metabs[duplicated(metabs$sample), ]
+datatable(dups.df)
+
+dup.samples <- metabs[duplicated(metabs$sample), "sample"]
+
+for (x in dup.samples) {
+    cat("#### ", x, "\n\n")
+    nas <- data.frame(cbind(
+        summary(rowSums(is.na(metabs[which(metabs$sample == x)[1], 20:ncol(metabs)]))),
+        summary(rowSums(is.na(metabs[which(metabs$sample == x)[2], 20:ncol(metabs)])))
+    ))
+    names(nas) <- which(metabs$sample == x)
+    print(htmltools::tagList(DT::datatable(nas,
+        escape = T, height = "100%", class = "cell-border stripe",
+        options = list(dom = "Blfrtip", scrollX = TRUE, .noWS = NULL)
+    )))
+    cat("\n\n")
+    # Plot the two pairs of data
+    plot(t(metabs[which(metabs$sample == x), 20:ncol(metabs)]))
+    cat("\n\n")
+}
+
+## samples look very similar, we'll remove one duplicate randomly
+metabs <- metabs[!duplicated(metabs$sample), ]
+
+# clean up
+rm(dup.samples, nas)
+```
+
+
+### {.unnumbered .unlisted}
+We see `r nrow(dups.df)` duplicates. After evaluating the metabolites distribution across these duplicates, we decide to randomly remove one duplicate for each pair.
+
+### Missing values
+```{r NAs -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+# Check participants with all met data missing
+metabs$allNA <- apply(metabs[, 20:ncol(metabs)],
+    MARGIN = 1, FUN = function(x) all(is.na(x))
+)
+
+summary(metabs$allNA)
+
+# NONE missing- remove allNA column
+metabs$allNA <- NULL
+
+
+# check missingess per individual
+summary(rowSums(is.na(metabs[, 20:ncol(metabs)])))
+hist(summary(rowSums(is.na(metabs[, 20:ncol(metabs)]))), breaks = 10)
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max.
+# 0.0000  0.0000  0.0000  0.3636  0.0000  6.0000
+
+row.names(metabs) <- metabs$sample
+
+
+## Exclude individuals with missing data in more than 30% of metabolites -!!!
+metabs.f <- metabs[, 20:ncol(metabs)][which(rowMeans(is.na(metabs[, 20:ncol(metabs)])) <= 0.3), ]
+
+# 0 individuals have more than 20% of missing data-> 297 individuals left
+# Exclude metabolites with missing data in more than 30% of metabolites
+metabs.f2 <- metabs.f[, which(colMeans(is.na(metabs.f)) <= 0.3), ]
+
+dim(metabs.f2)
+# [1]  297 30  left
+# no metabolites missing more than 20%
+
+## merge back the filtered dataset
+#### keep standards
+stds.peaks <- met_annotation[grepl("Steno", met_annotation$Metabolite.name), ]$peak
+stds <- metabs.f[, stds.peaks]
+
+metabs.f <- merge(metabs[, 1:19], metabs.f2, by = "row.names")
+metabs.f$Row.names <- NULL
+dim(metabs.f)
+```
+
+No samples were removed due to the number of missing values (all <20%). 
+Missing values were imputed using kNN clustering approach with k=10.
+
+```{r impute missing values -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+### add back standards (for normalization/plotting)
+stds.toadd <- setdiff(standards, colnames(metabs.f))
+metabs.stds <- metabs[, stds.toadd]
+metabs.stds <- metabs.stds[row.names(metabs.stds) %in% metabs.f$sample, ]
+metabs.stds <- metabs.stds[match(metabs.f$sample, row.names(metabs.stds)), ]
+metabs.f <- cbind(metabs.f, metabs.stds)
+  
+### impute missing values with kNN
+metabs.imp <- kNN(metabs.f[, 20:ncol(metabs.f)], k = 10)
+metabs.imp <- cbind(metabs.f[, 1:19], metabs.imp)
+metabs.imp <- metabs.imp %>%
+    dplyr::select(-contains("_imp")) %>%
+    as.data.frame()
+metabs.imp[, 20:ncol(metabs.imp)] <- sapply(metabs.imp[, 20:ncol(metabs.imp)], as.numeric) # convert metabolite data back to numeric
+
+rm(metabs, metabs.f)
+```
+
+
+### Data normalization - internal standards
+```{r standards normalization, echo=FALSE, message=FALSE, warning=FALSE}
+# edit metadata to change NAs for blank, etc
+metabs.imp$fullClass <- ifelse(is.na(metabs.imp$Class),
+    ifelse(grepl("lank", metabs.imp$sample), "technical_blank",
+        ifelse(grepl("Cal", metabs.imp$sample), "technical_Cal",
+            ifelse(grepl("CP", metabs.imp$sample), "technical_CP",
+                ifelse(grepl("RPO", metabs.imp$sample), "technical_RPO", NA)
+            )
+        )
+    ), metabs.imp$Class
+)
+metabs.imp <- metabs.imp %>%
+    dplyr::relocate(fullClass, .after = "Cerebrospinal.fluids_Total.Tau.pg.ml")
+metabs.imp$fullClass <- gsub("No cognitive impairment", "HC", metabs.imp$fullClass)
+
+## remove empty samples
+metabs.imp <- metabs.imp[!is.na(metabs.imp$fullClass), ]
+
+metabolites <- metabs.imp
+row.names(metabolites) <- metabolites$sample
+
+metadata <- metabolites[, 1:20]
+metabolites <- metabolites[, 21:ncol(metabolites)]
+## filter out annotated_mets
+annotated_mets <- annotated_mets %>% dplyr::filter(peak %in% names(metabolites))
+# identical(names(metabolites), annotated_mets$peak)
+
+colnames(metabolites) <- make.names(annotated_mets$Metabolite.name)
+
+## list standards
+# Below internal standards were added to each sample before the extraction. So they could be used to normalize individual compound.
+before_process <- c(
+    "Glutamic acid d5 3TMS ISTD Steno", "Valine d8 2TMS ISTD Steno", "Heptadecanoic acid d33 TMS ISTD Steno",
+    "Succinic acid d4 2TMS ISTD Steno", "Tritriacontane C33 ISTD Steno"
+)
+before_process <- make.names(before_process)
+
+# Below internal standards were added to each sample during derivatization. These internal standards could be used to monitor the % RSD of these compound across the batch analysis.
+derivatization <- c(
+    "Undecane C11 ISTD Steno", "Pentadecane C15 ISTD Steno", "Heptadecane C17 ISTD Steno",
+    "Heneicosane C21 ISTD Steno", "Pentacosane C25 Steno ISTD", "Nonacosane C29 ISTD Steno"
+)
+derivatization <- make.names(derivatization)
+
+# "X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno"
+
+## normalize
+metabolites.t <- t(metabolites)
+is_std <- rownames(metabolites.t) %in% before_process
+G <- with(metadata, model.matrix(~ -1 + fullClass))
+
+crmn.norm <- normalize(metabolites.t, "crmn", factors = G, standards = is_std)
+nomis.norm <- normalize(metabolites.t, "nomis", standards = is_std)
+
+pca.crmn <- pca(scale(log(t(crmn.norm))))
+pca.crmn <- scores(pca.crmn)
+pca.crmn <- pca.crmn |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sample") |>
+    left_join(metadata, by = "sample")
+
+pca.nomis <- pca(scale(log(t(nomis.norm))))
+pca.nomis <- scores(pca.nomis)
+pca.nomis <- pca.nomis |>
+    as.data.frame() |>
+    tibble::rownames_to_column("sample") |>
+    left_join(metadata, by = "sample")
+
+ggpubr::ggarrange(
+    ggplot(pca.crmn, aes(PC1, PC2, color = Run, shape = fullClass)) +
+        geom_point() +
+        labs(title = "CRMN") +
+        guides(color = F) +
+        scale_shape_manual(values = c(15, 16, 17, 18, 25, 8, 4, 9)),
+    ggplot(pca.nomis, aes(PC1, PC2, color = Run, shape = fullClass)) +
+        geom_point() +
+        labs(title = "NOMIS") +
+        guides(color = F) +
+        scale_shape_manual(values = c(15, 16, 17, 18, 25, 8, 4, 9)),
+    common.legend = TRUE
+)
+
+
+
+# mets.norm <- as.data.frame(t(mets.norm))
+# row.names(mets.norm) == metadata$sample
+```
+
+#### 1. Variance Partitioning (R² for technical vs biological factors)
+
+NOMIS: Higher variance explained by technical factors → means technical effects still dominate after normalization.
+
+CRMN: Much lower variance explained by technicals → suggests NOMIS reduces technical bias more effectively. ✅
+
+```{r var partition normalization approaches, echo=FALSE, message=FALSE, warning=FALSE}
+metadata$type <- ifelse(metadata$fullClass %in% c("HC", "MCI_Non-AD", "MCI", "AD", "VaD"), "sample",
+    ifelse(grepl("blank", metadata$fullClass), "blank", "QC")
+)
+# Example function to compute R² from a linear model
+get_r2 <- function(y, metadata) {
+    model <- lm(y ~ fullClass + type, data = metadata)
+    summary(model)$adj.r.squared
+}
+
+# Apply across features
+r2_crmn <- apply(crmn.norm, 1, function(x) get_r2(x, metadata))
+r2_nomis <- apply(nomis.norm, 1, function(x) get_r2(x, metadata))
+
+# Compare distributions
+boxplot(r2_crmn, r2_nomis,
+    names = c("CRMN", "NOMIS"),
+    main = "Variance explained (adj. R²)"
+)
+```
+
+#### 2. Coefficient of Variation (CV) for QC Samples
+
+NOMIS: Slightly higher spread in CVs.
+
+CRMN: Lower median and tighter CVs in QC samples → better reproducibility. ✅
+
+```{r cv normalizations, echo=FALSE, message=FALSE, warning=FALSE}
+# Subset QC samples
+qc_samples <- metadata %>% filter(type == "QC")
+
+# Calculate CV
+cv_fun <- function(mat, qc_ids) {
+    mat_qc <- mat[, qc_ids]
+    apply(mat_qc, 1, function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE) * 100)
+}
+
+cv_crmn <- cv_fun(crmn.norm, qc_samples$sample)
+cv_nomis <- cv_fun(nomis.norm, qc_samples$sample)
+
+# Plot comparison
+boxplot(cv_crmn, cv_nomis,
+    names = c("CRMN", "NOMIS"),
+    main = "QC Coefficient of Variation (%)"
+)
+```
+
+#### 3. Relative Log Expression (RLE) Plots
+
+Similar distributions, lower distributions for blanks
+
+```{r RLE plots, echo=FALSE, message=FALSE, warning=FALSE}
+library(EDASeq)
+
+par(mfrow = c(1, 2))
+plotRLE(crmn.norm, outline = FALSE, main = "CRMN RLE", ylab = "Relative Log Expression")
+plotRLE(nomis.norm, outline = FALSE, main = "NOMIS RLE", ylab = "Relative Log Expression")
+```
+
+
+#### 4. Clustering of Replicates
+
+CRMN clusters pooled samples and blanks separately from the samples.
+
+```{r clustering heatmap, echo=FALSE, message=FALSE, warning=FALSE}
+library(pheatmap)
+
+# Distance matrix and clustering
+dist_crmn <- dist(t(crmn.norm))
+dist_nomis <- dist(t(nomis.norm))
+
+pheatmap(as.matrix(dist_crmn), main = "CRMN - Sample Clustering")
+pheatmap(as.matrix(dist_nomis), main = "NOMIS - Sample Clustering")
+```
+
+#### 5. Biological Signal Preservation (Example: AD vs HC)
+Both methods recover similar biological hits.
+
+```{r LMs, echo=FALSE, message=FALSE, warning=FALSE}
+# Example differential test
+library(limma)
+
+# Design matrix
+metadata$fullClass2 <- factor(make.names(metadata$fullClass), levels = make.names(unique(metadata$fullClass)))
+design <- model.matrix(~ 0 + metadata$fullClass2)
+colnames(design) <- levels(metadata$fullClass2)
+
+contrast.matrix <- makeContrasts(
+    ADvsHC = AD - HC,
+    levels = design
+)
+
+# Fit linear model
+fit_crmn <- lmFit(crmn.norm, design)
+fit_crmn <- contrasts.fit(fit_crmn, contrast.matrix)
+fit_crmn <- eBayes(fit_crmn)
+
+fit_nomis <- lmFit(nomis.norm, design)
+fit_nomis <- contrasts.fit(fit_nomis, contrast.matrix)
+fit_nomis <- eBayes(fit_nomis)
+
+# Get top results
+top_crmn <- topTable(fit_crmn, coef = "ADvsHC", number = 20)
+top_nomis <- topTable(fit_nomis, coef = "ADvsHC", number = 20)
+
+head(top_crmn)
+head(top_nomis)
+```
+
+
+
+
+```{r center and scale data, echo=FALSE, message=FALSE, warning=FALSE}
+# mets.norm <- nomis.norm
+mets.norm <- crmn.norm
+
+mets.norm <- log10(mets.norm)
+mets.norm <- as.data.frame(t(mets.norm))
+mets.scaled <- as.data.frame(sapply(mets.norm, function(x) {
+    scale(x, center = TRUE, scale = TRUE)
+}))
+row.names(mets.scaled) <- row.names(mets.norm)
+normalized_data <- cbind(metadata, mets.scaled)
+# write.table(normalized_data, file.path(dir_data, "untargetedANNOT_NOMISnomralized.txt"), row.names = FALSE, sep = "\t")
+write.table(normalized_data, file.path(dir_data, "untargetedANNOT_CRMNnomralized.txt"), row.names = FALSE, sep = "\t")
+```
+
+```{r Visualize distribution 1 -annotated-, echo=FALSE, message=FALSE, warning=FALSE, eval = FALSE}
+colnames(metabs.imp)[23:ncol(metabs.imp)] <- make.names(annotated_mets$Metabolite.name)
+
+
+# Vector of all lipids to iterate through
+Metabolite_names <- names(normalized_data)[23:ncol(normalized_data)]
+# Visualize histograms
+p <- list()
+for (j in Metabolite_names) {
+    p.raw <- ggplot(metabs.imp, aes(x = (metabs.imp[, j]))) +
+        geom_histogram(aes_string(x = metabs.imp[, j]), bins = 30) +
+        xlab(paste0(names(metabs.imp[j]), " - Raw")) +
+        theme(
+            axis.text = element_text(size = 5), axis.title = element_text(size = 5),
+            legend.text = element_text(size = 5), legend.title = element_text(size = 5)
+        )
+
+    p.log <- ggplot(normalized_data, aes(x = normalized_data[, j])) +
+        geom_histogram(aes_string(x = normalized_data[, j]), bins = 30) +
+        xlab(paste0(names(normalized_data[j]), " - log10")) +
+        theme(
+            axis.text = element_text(size = 5),
+            axis.title = element_text(size = 5),
+            legend.text = element_text(size = 5),
+            legend.title = element_text(size = 5)
+        )
+
+    p[[j]] <- ggarrange(p.raw, p.log, ncol = 2)
+}
+
+# Write pdf with all figures
+# ggsave("Plasma_Histograms_raw_vs_CRMN_log10_KNN_metabsmetabolomics.pdf",
+#        marrangeGrob(grobs=p, nrow=2, ncol=1),
+#        path = dir_res)
+# dev.off()
+```
+
+
+#### Normalized data distribution 
+```{r norm plots -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+bplot.log <- cbind(sample = normalized_data$sample, normalized_data[, 21:ncol(normalized_data)])
+bplot.log <- bplot.log %>%
+    reshape2::melt()
+
+print(ggplot(bplot.log, (aes(sample, value))) +
+    geom_boxplot(outlier.fill = NA) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = .5)))
+```
+
+#### PCA before removing technical samples
+```{r PCA norm, echo=FALSE, message=FALSE, warning=FALSE, fig.width=6, fig.height=6.5}
+metabolites <- normalized_data[, 23:ncol(normalized_data)]
+metadata <- normalized_data[, 1:21]
+
+pca.normalized.all <- PCAtools::pca(t(metabolites), metadata)
+bplot <- biplot(pca.normalized.all,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+```
+
+#### Log-transformed data distribution - without technical samples
+```{r exclude technical -annotated-, echo=FALSE, message=FALSE, warning=FALSE}
+# edit metadata to change NAs for blank, etc
+
+## remove technical samples
+normalized_data <- normalized_data %>%
+    dplyr::filter(!grepl("technical", fullClass)) %>%
+    dplyr::filter(!is.na(fullClass))
+
+bplot.log <- cbind(sample = normalized_data$sample, normalized_data[, 23:ncol(normalized_data)])
+bplot.log <- bplot.log %>%
+    reshape2::melt()
+
+print(ggplot(bplot.log, (aes(sample, value))) +
+    geom_boxplot(outlier.fill = NA) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = .5)))
+```
+
+
+### Check derivatization and injector standards distribution
+
+#### Derivatization standards
+
+```{r stds distribution, echo=FALSE, message=FALSE, warning=FALSE}
+met_annotation_stds <- met_annotation[met_annotation$peak %in% names(stds), ]
+# identical(names(stds), met_annotation_stds$peak)
+colnames(stds) <- make.names(met_annotation_stds$Metabolite.name)
+
+derivatization <- c(derivatization)
+injector <- "X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno"
+
+stds.df <- normalized_data[, derivatization]
+
+stds.df$sample <- normalized_data$sample
+stds.df.m <- reshape2::melt(stds.df)
+derv.plot1 <- ggplot(stds.df.m, aes(variable, value)) +
+    geom_boxplot() +
+    theme_bw() +
+    labs(x = "Derivatization standards", y = "Normalized expression", title = "Derivatization standards BEFORE correction") +
+    theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+```
+
+```{r correct deriv, echo=FALSE, message=FALSE, warning=FALSE}
+## compute median per sample (in derivatization subset)
+stds.df$sample <- NULL
+median_std <- apply(stds.df, 1, median, na.rm = TRUE)
+median_std <- as.numeric(median_std)
+
+# Scale so median factor = 0 (centered on log scale)
+median_std <- median_std - median(median_std, na.rm = T)
+
+# Apply normalization by subtraction (since we're in log10 space)
+metabolites.names <- setdiff(colnames(normalized_data[, 23:ncol(normalized_data)]), derivatization)
+metabolites_norm_derv <- normalized_data
+# metabolites_norm_derv[, metabolites.names] <- sweep(mets.norm[, metabolites.names], 1, median_std, "-")
+metabolites_norm_derv[, 23:ncol(metabolites_norm_derv)] <- sweep(normalized_data[, 23:ncol(normalized_data)], 1, median_std, "-")
+
+## re-check dervs
+derv.plot2 <- metabolites_norm_derv %>%
+    dplyr::select(derivatization) %>%
+    reshape2::melt() %>%
+    ggplot(aes(variable, value)) +
+    geom_boxplot() +
+    theme_bw() +
+    labs(x = "Derivatization standards", y = "Normalized expression", title = "Derivatization standards AFTER correction") +
+    theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1))
+```
+
+
+```{r}
+ggpubr::ggarrange(derv.plot1, derv.plot2)
+
+
+## remove standards from dataset
+normalized_data <- normalized_data[, !(names(normalized_data) %in% c(before_process, derivatization))]
+# write.table(normalized_data, file.path(dir_data, "CSF_untargetedALL_standards_normalized_metabolites"), row.names = FALSE, sep = "\t")
+
+metabs.log <- normalized_data
+```
+
+
+### Check injector standard
+```{r std injection, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+# Compute mean & SD on log10 scale
+mean_injector <- mean(normalized_data$X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno, na.rm = TRUE)
+sd_injector <- sd(normalized_data$X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno, na.rm = TRUE)
+
+# Flag samples more than 2 SD from mean (adjust threshold if needed)
+injector_outliers <- ifelse(abs(normalized_data$X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno - mean_injector) > 3 * sd_injector, "yes", "no")
+
+
+
+normalized_data %>%
+    dplyr::select(sample, injector, fullClass) %>%
+    dplyr::mutate(outlier = injector_outliers) %>%
+    dplyr::filter(!is.na(outlier)) %>% 
+    ggplot(aes(sample, X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno, shape = outlier, color = fullClass)) +
+    geom_point() +
+    geom_hline(yintercept = mean(normalized_data[, injector]), color = "red") +
+    geom_hline(yintercept = mean(normalized_data[, injector]) + 3 * sd_injector, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = mean(normalized_data[, injector]) - 3 * sd_injector, color = "red", linetype = "dashed") +
+    scale_color_manual(values = color_key$fullClass) +
+    theme_bw() +
+    labs(x = NULL, title = "Injector values across samples after normalization") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5))
+```
+
+We see some outliers outside of the ±3*SD threshold. We also see that the class groups are evenly distributed along the injector values. 
+
+
+```{r injector outliers, echo=FALSE, message=FALSE, warning=FALSE}
+normalized_data %>%
+    dplyr::mutate(outlier = injector_outliers) %>%
+    dplyr::filter(outlier == "yes") %>%
+    dplyr::select(
+        Name, sample, DDBBno, Gender, AgeAtVisit, CognitiveSyndrome, Diagnosis,
+        Class, fullClass, MMSE_Score, outlier, Cerebrospinal.fluids_Amyloid.beta.42.pg.ml,
+        Cerebrospinal.fluids_Phospho.Tau.pg.ml, Cerebrospinal.fluids_Total.Tau.pg.ml, 
+        "BMI", "Statins", "Hormone replacement therapy", "Neuropsychology_ACE_Total score", 
+        "Genetics_Risk factors_APOE", "CSF_glucose"
+    ) %>%
+    DT::datatable(., options = list(scrollX = TRUE))
+
+
+normalized_data <- normalized_data %>%
+    dplyr::mutate(outlier = injector_outliers) %>%
+    dplyr::filter(outlier != "yes") %>%
+    dplyr::select(-X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno, -outlier) %>%
+    as.data.frame()
+
+## remove standards from dataset
+normalized_data <- normalized_data[, !(names(normalized_data) %in% c(before_process, derivatization, "X4.4..Dibromooctafluorobiphenyl..Injector.reproducibility..Steno"))]
+
+# write.table(normalized_data, file.path(dir_data, "untargetedALL_standards_normalized_metabolites"), row.names = FALSE, sep = "\t")
+
+metabs.log <- normalized_data
+```
+
+
+### PCAs
+```{r 1st PCA -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+pca.normalized.f <- PCAtools::pca(t(metabs.log[, 23:ncol(metabs.log)]), metadata = metabs.log[, 1:21])
+bplot <- biplot(pca.normalized.f,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+# autoplot(prcomp(metabs.log[, 17:ncol(metabs.log)]), data = metabs.log, color = "fullClass")
+```
+
+### Outliers assessment - samples
+After exclusion of the technical samples, we cannot identify any outlier sample, neither in the PCA plots nor by distance to cluster center analysis.
+
+```{r outliers on samples -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+# check for outliers using a combination of PCA and kmeans clustering
+autoplot(pca_all <- prcomp(metabs.log[, 23:ncol(metabs.log)]), data = metabs.log, colour = "fullClass", x = 1, y = 2, label = TRUE, label.size = 3)
+autoplot(pca_all <- prcomp(metabs.log[, 23:ncol(metabs.log)]), data = metabs.log, colour = "fullClass", x = 1, y = 3, label = TRUE, label.size = 2)
+
+
+# investigate further with k-means clustering
+kmeans.result <- kmeans(metabs.log[, 23:ncol(metabs.log)], centers = 2)
+
+# "centers" is a data frame of 3 centers but the length of iris dataset so we can canlculate distance difference easily.
+centers <- kmeans.result$centers[kmeans.result$cluster, ]
+
+# calculate distance
+distances <- sqrt(rowSums((metabs.log[, 23:ncol(metabs.log)] - centers)^2))
+outliers_ids <- cbind(distances, metabs.log)
+outliers_ids2 <- cbind(kmeans.result$cluster, outliers_ids)
+
+outliers <- outliers_ids2[order(outliers_ids2$distances), ]
+
+# show ID of observations with the largest distance to the clusters
+tibble(outliers) %>%
+    dplyr::select(distances, sample) %>%
+    arrange(-distances)
+
+# all outliers with distances over 14
+outliers[outliers$distances > 14, "sample"]
+metabs.log %>%
+    dplyr::filter(sample %in% outliers[outliers$distances > 14, "sample"]) %>%
+    dplyr::select(Name:fullClass) %>%
+    DT::datatable(.)
+
+## remove outliers
+metabs.log <- metabs.log %>%
+    dplyr::filter(!sample %in% outliers[outliers$distances > 14, "sample"]) %>%
+    as.data.frame()
+```
+
+
+### Outliers identification - metabolites
+No differences are seen either pre- and post-winsorizing the metabolites data
+```{r outliers on metabolites -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7.5, fig.height=6}
+# Define outliers as anything outside the 0.01%-99.99% quantiles,
+# equivalent of  4xSD away from the mean.
+# Alternatively use 0.3%-99.7% equivalent of 3xSD from the mean.
+tmp_outlier_range <- c(0.0001, 0.9999)
+
+mets <- metabs.log[, 23:ncol(metabs.log)]
+row.names(mets) <- metabs.log$sample
+
+
+# Windsorizing outliers
+mets_wind <- tibble(mets) %>%
+    mutate(across(
+        where(is.numeric),
+        ~ Winsorize(., quantile(., probs = tmp_outlier_range))
+    )) %>%
+    data.frame()
+
+mets_wind <- cbind(metabs.log[, 1:22], mets_wind)
+
+# Visualize difference with PCA
+# Principal component 1 and 2
+autoplot(
+    pca_all <- prcomp(metabs.log[, 23:ncol(metabs.log)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = metabs.log, colour = "fullClass",
+    x = 1, y = 2, label = TRUE, label.size = 3
+) +
+    ggtitle("log-transformed metabolites PC 1 and 2")
+
+autoplot(
+    pca_all <- prcomp(mets_wind[, 23:ncol(mets_wind)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = mets_wind, colour = "fullClass",
+    x = 1, y = 2, label = TRUE, label.size = 3
+) +
+    ggtitle("windosrized log-transformed metabolites PC 1 and 2")
+
+
+# Principal component 3 and 4
+autoplot(
+    pca_all <- prcomp(metabs.log[, 23:ncol(metabs.log)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = metabs.log, colour = "fullClass",
+    x = 3, y = 4, label = TRUE, label.size = 3
+) +
+    ggtitle("log-transformed metabolites PC 3 and 4")
+
+autoplot(
+    pca_all <- prcomp(mets_wind[, 23:ncol(mets_wind)],
+        center = TRUE, scale. = TRUE
+    ),
+    data = mets_wind, colour = "fullClass",
+    x = 3, y = 4, label = TRUE, label.size = 3
+) +
+    ggtitle("windosrized log-transformed metabolites PC 3 and 4")
+
+# Truncation of outlier lipid levels did not result in any particular difference for the log-transformed data
+
+rm(tmp_outlier_range, pca_all)
+```
+
+
+### Final PCA without outliers and normalized data
+```{r pca2 -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.width = 10, fig.height=5}
+mets.f <- metabs.log[, 23:ncol(metabs.log)]
+row.names(mets.f) <- metabs.log$sample
+mets.mtdt.f <- metabs.log[, 1:21]
+row.names(mets.mtdt.f) <- metabs.log$sample
+pca.metabs2 <- PCAtools::pca(as.data.frame(t(mets.f)), metadata = mets.mtdt.f)
+screeplot(pca.metabs2, components = 1:25)
+```
+
+
+```{r pcatools biplot -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=9}
+bplot <- biplot(pca.metabs2,
+    showLoadings = T,
+    labSize = 5, pointSize = 5, sizeLoadingsNames = 5,
+    colby = "fullClass", colkey = color_key$fullClass, legendPosition = "bottom",
+    encircle = FALSE, ellipse = TRUE, encircleFill = FALSE, ellipseFill = FALSE,
+    lab = NULL
+)
+bplot
+```
+
+```{r pcatools pairs -annotated-, echo=FALSE, message=FALSE, warning=FALSE, fig.height=12, fig.width=12}
+plot_legend <- get_legend(bplot)
+pplot <- pairsplot(pca.metabs2, colby = "fullClass", colkey = color_key$fullClass)
+print(cowplot::plot_grid(pplot, plot_legend, nrow = 2, rel_heights = c(1.9, 0.1)))
+```
+
+```{r save data -annotated-, echo=FALSE, message=FALSE, warning=FALSE, eval = TRUE}
+write.table(metabs.log, file.path(dir_data, "Plasma_untargetedANNOT_metabs_CRMNstandardsnormalized.txt"), sep = "\t", row.names = F)
+```
+
+
+# Cohort - confirm we have the same numbers
+```{r metadata diff, echo=FALSE, message=FALSE, warning=FALSE}
+metadata <- metabs.log[, 1:21]
+metadata$Statins <- ifelse(metadata$Statins == 0, "No", "Yes")
+metadata$`Hormone replacement therapy` <- ifelse(metadata$`Hormone replacement therapy` == 0, "No", "Yes")
+
+library(tableone)
+## Vector of variables to summarize
+vars_test <- c(
+    "Gender", "AgeAtVisit", "BMI", "CognitiveSyndrome", "Diagnosis", "MMSE_Score", "Cerebrospinal.fluids_Amyloid.beta.42.pg.ml",
+    "Cerebrospinal.fluids_Phospho.Tau.pg.ml", "Cerebrospinal.fluids_Total.Tau.pg.ml", "Genetics_Risk factors_APOE",
+    "Statins", "Hormone replacement therapy", "Neuropsychology_ACE_Total score", "CSF_glucose"
+)
+## Vector of categorical variables that need transformation
+catVars <- c("Gender", "CognitiveSyndrome", "Diagnosis")
+
+tab3 <- CreateTableOne(vars = vars_test, strata = "fullClass", data = metadata, factorVars = catVars)
+
+tab_df <- print(tab3, printToggle = FALSE, noSpaces = TRUE)
+tab_df <- tab_df[, -ncol(tab_df)]
+DT::datatable(tab_df, options = list(
+    scrollX = TRUE,
+    pageLength = nrow(tab_df), # or -1 to display all rows if you're using lengthMenu
+    lengthMenu = list(c(-1, 10, 25, 50), c("All", "10", "25", "50"))
+), class = "cell-border stripe")
+```
+
+# Session
+```{r session info, echo=FALSE, message=FALSE, warning=FALSE}
+pander::pander(sessionInfo())
+```
