@@ -1,25 +1,57 @@
-# Systems medicine approach identifies CSF polyol dysregulation across the dementia continuums
+# Systems Medicine Approach Identifies CSF Polyol Dysregulation Across the Dementia Continuums
 
-In this repository, we have submitted the code necessary to replicate our manuscript titled "Systems medicine approach identifies CSF polyol dysregulation across the dementia continuums" with our datasets. The repository is organized as follows:
+## Overview
 
-/code
-    - ../metabolomics_evaluation: QC, EDA and univariate statistics RMarkdowns for both CSF and plasma tissues targeted and untargeted metabolomics. For each tissue-targeted/untargeted GC/MS combination, we include:
-        - 00_tissue_targeted/untargeted_QC.Rmd: includes general data quality evaluation, peak-filtering, blank-signal removal, missingness and duplications evaluation and data normalization assessment.
-        - 01_tissue_targeted/untargeted_EDA.Rmd: exploratory data analysis, with PCA analyses to identify outliers and potential confounding factors.
-        - 03A_bayesian_modelling.R: R script dedicated to the Bayesian models run for the binary clinical groups contrasts.
-        - 03_tissue_targeted/untargeted_univariate.Rmd: includes all tested univariate statistical approaches for both continuous clinical biomarkers and bayesian modelling results parsing.
-    - ../modelling: directory with the Python scripts and Quarto notebooks for the ElasticNet regression modelling and Structural Equation Modelling (SEM) approaches. Script names are self-explanatory of what the script includes.
-        - 000_dementia_ElasticNet_modelruns.py
-        - 01_demenntiabiomarkers_elasticnet_discovery.qmd
-        - 001_dementia_ElasticNEt_modelbootstrapping.py
-        - 02_dementiabiomarkers_elasticnet_bootstrapping.qmd
-        - 002_dementia_ElasticNet_validation.py
-        - 03_dementiabiomarkers_elasticnet_validation.qmd
-        - 003_dementia_SEM_mediation.py
-        - 04_dementiabiomarkers_SEM_mediation.qmd
-        - 004_SNPs_extraction.py
-        - 004_SNPs_extraction.sh
-        - 005_dementia_SEM_validation_genetics.py
-        - 05_dementiabiomarkers_SEM_mediation_validation.qmd
-    - metabolomics_validation_CruchagaCohort.R: script for the validation of both our metabolomics and proteomics findings in the Cruchaga (ADNI) cohort
-    - polyols_focused_analysis.R: main script for the manuscript CSF polyols-centered analysis and figures generation.
+This repository contains the code necessary to replicate the findings from our manuscript titled **"Systems medicine approach identifies CSF polyol dysregulation across the dementia continuums"** along with the associated datasets.
+
+## Repository Structure
+
+### `/code` — Analysis and Modeling Scripts
+
+#### `metabolomics_evaluation/`
+Quality control, exploratory data analysis, and univariate statistics for CSF and plasma targeted and untargeted metabolomics.
+
+For each tissue–targeted/untargeted combination, we provide:
+
+- **`00_tissue_targeted/untargeted_QC.Rmd`** — Data quality evaluation including:
+  - Peak filtering and blank-signal removal
+  - Missingness and duplication assessment
+  - Data normalization evaluation
+
+- **`01_tissue_targeted/untargeted_EDA.Rmd`** — Exploratory data analysis including:
+  - PCA analyses to identify outliers
+  - Potential confounding factor identification
+
+- **`03_tissue_targeted/untargeted_Univariate.Rmd`** — Statistical testing:
+  - Univariate statistical approaches for continuous clinical biomarkers
+  - Bayesian modeling results
+
+- **`03A_bayesian_modelling.R`** — R script for Bayesian models applied to binary clinical group contrasts
+
+#### `modelling/`
+Python scripts and Quarto notebooks for ElasticNet regression modeling and Structural Equation Modeling (SEM) approaches:
+
+- **`000_dementia_ElasticNet_modelruns.py`** — ElasticNet model discovery
+- **`01_dementiabiomarkers_elasticnet_discovery.qmd`** — Discovery analysis notebook
+- **`001_dementia_ElasticNet_modelbootstrapping.py`** — Model bootstrapping
+- **`02_dementiabiomarkers_elasticnet_bootstraping.qmd`** — Bootstrapping notebook
+- **`002_dementia_ElasticNet_validation.py`** — Model validation
+- **`03_dementiabiomarkers_elasticnet_validation.qmd`** — Validation notebook
+- **`003_dementia_SEM_mediation.py`** — SEM mediation analysis
+- **`04_dementiabiomarkers_SEM_mediation.qmd`** — SEM mediation notebook
+- **`005_dementia_SEM_validation_genetics.py`** — Genetic validation of SEM results
+- **`05_dementiabiomarkers_SEM_mediation_validation.qmd`** — Validation notebook
+- **`004_SNPs_extraction.py`** & **`004_SNPs_extraction.sh`** — SNP extraction pipeline
+
+#### Root Analysis Scripts
+
+- **`metabolomics_validation_CruchagaCohort.R`** — Validation of metabolomics and proteomics findings in the Cruchaga (ADNI) cohort
+- **`polyols_focused_analysis.R`** — Main manuscript analysis and figure generation focused on CSF polyols
+
+### `/data` — Datasets
+
+Raw and processed data files organized by sample type and external cohorts
+
+### `/results` — Output Directory
+
+Analysis results and generated outputs
