@@ -1,0 +1,5 @@
+RIGS_plasmaGCMS/data
+RIGS_plasmaGCMS/results
+*/*.Rproj
+*/*.Rhistory
+.Rproj.user
