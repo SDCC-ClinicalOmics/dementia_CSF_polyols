@@ -1,4 +1,4 @@
-# Systems Medicine Approach Identifies CSF Polyol Dysregulation Across the Dementia Continuums
+# Polyol pathway dysregulation in CSF links glucose metabolism to tau pathology independently of amyloid and genetic predisposition
 
 ## Overview
 
