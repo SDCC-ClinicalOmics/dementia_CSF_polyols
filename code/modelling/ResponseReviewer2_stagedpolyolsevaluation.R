@@ -26,12 +26,12 @@ library(patchwork)
 
 # --- Diagnostic column -------------------------------------------------------
 DIAGNOSIS_COL <- "fullClass"     # as in the Python SEM script
-STAGE_ORDER   <- c("HC", "MCI", "AD", "VaD")   # ordered by severity
+STAGE_ORDER   <- c("NCI", "MCI-AD", "Dementia-AD", "MIX")   # ordered by severity
 # If your R data uses "NCI" instead of "HC", change the first value:
 # STAGE_ORDER <- c("NCI", "MCI", "AD", "VaD")
 
 # Display labels for figures (matched to STAGE_ORDER)
-STAGE_LABELS  <- c("HC", "MCI", "AD", "VaD")
+STAGE_LABELS  <- c("NCI", "MCI-AD", "Dementia-AD", "MIX")
 
 # Numeric coding for trend test (0 = healthiest, 3 = most severe)
 STAGE_NUMERIC <- setNames(0:3, STAGE_ORDER)
@@ -45,14 +45,14 @@ POLYOL_VARS <- c(
   "meso.Erythritol",
   "gluc.erythitol" # ratio
 )
-TAU_VARS     <- c("TAU", "PTAU")
-AMYLOID_VAR  <- "ABETA42"
+TAU_VARS     <- c("tTau", "pTau")
+AMYLOID_VAR  <- "Aβ42"
 ALL_OUTCOMES <- c(TAU_VARS, AMYLOID_VAR)
 COVARIATES   <- c("AgeAtVisit", "Gender", "BMI")
 
 # Clean metabolite labels for figures
 MET_LABELS <- c(
-  L.....Arabitol           = "L-Arabitol",
+  L.....Arabitol       = "L-Arabitol",
   Ribonic.acid         = "Ribonic acid",
   D.Threitol           = "D-Threitol",
   Sorbitol             = "Sorbitol",
@@ -64,7 +64,16 @@ MET_LABELS <- c(
 # --- Data loading -------------------------------------------------------------
 df <- read.table(here("data/csf_ratios2.csv"), header = T, sep = ";")
 df$Gender <- ifelse(df$Gender == "Female", 1, 2)
-
+df <- df |> 
+  dplyr::mutate(fullClass = case_when(
+    fullClass == "HC"  ~ "NCI",
+    fullClass == "MCI" ~ "MCI-AD",
+    fullClass == "AD"  ~ "Dementia-AD",
+    fullClass == "VaD" ~ "MIX"
+  )) |> 
+  dplyr::rename("tTau" = TAU,
+                "pTau" = PTAU,
+                "Aβ42" = ABETA42)
 # =============================================================================
 # 1. DATA PREPARATION
 # =============================================================================
@@ -217,8 +226,8 @@ trend_full <- pmap_dfr(trend_grid, ~ run_trend_test(..1, ..2, df_staged, "All st
 # AD spectrum only (HC → MCI → AD): removes VaD which follows different path
 trend_ad_spectrum <- pmap_dfr(trend_grid, ~ run_trend_test(
   ..1, ..2,
-  df_staged %>% filter(stage %in% c("HC", "MCI", "AD")),
-  "AD spectrum (HC→MCI→AD)"
+  df_staged %>% filter(stage %in% c("NCI", "MCI-AD", "Dementia.AD")),
+  "AD spectrum (NCI→MCI→AD)"
 ))
 
 trend_results <- bind_rows(trend_full, trend_ad_spectrum) %>%
@@ -276,9 +285,9 @@ make_heatmap_panel <- function(bm, pcor_data) {
           plot.title  = element_text(face = "bold", hjust = 0.5))
 }
 
-p_heat <- (make_heatmap_panel("TAU", pcor_staged) +
-           make_heatmap_panel("PTAU", pcor_staged) +
-           make_heatmap_panel("ABETA42", pcor_staged)) +
+p_heat <- (make_heatmap_panel("tTau", pcor_staged) +
+           make_heatmap_panel("pTau", pcor_staged) +
+           make_heatmap_panel("Aβ42", pcor_staged)) +
   plot_layout(ncol = 3, guides = "collect") +
   plot_annotation(
     title    = "Stage-stratified polyol–biomarker partial correlations",
@@ -296,8 +305,8 @@ ggsave("results/figures/staged_heatmap.png", p_heat, width = 12, height = 5,
 # Main figure for the reviewer response / manuscript supplement.
 # Shows uncertainty clearly — important given small NCI and MCI groups.
 
-stage_colours <- c(HC  = "#4E79A7", MCI = "#F28E2B",
-                   AD  = "#E15759", VaD = "#76B7B2")
+stage_colours <- c(NCI  = "#4E79A7", "MCI-AD" = "#F28E2B",
+                   "Dementia-AD"  = "#E15759", MIX = "#76B7B2")
 
 p_dotci <- pcor_staged %>%
   filter(biomarker %in% TAU_VARS) %>%
@@ -368,7 +377,7 @@ p_trend <- ggplot(trend_viz,
                 position = position_dodge(0.15)) +
   geom_line(linewidth = 1.0, position = position_dodge(0.15)) +
   geom_point(size = 3.5, position = position_dodge(0.15)) +
-  scale_colour_manual(values = c(TAU = "#4E79A7", PTAU = "#F28E2B"),
+  scale_colour_manual(values = c("tTau" = "#4E79A7", "pTau" = "#F28E2B"),
                       name = "Tau biomarker") +
   scale_y_continuous(
     breaks = seq(-0.2, 0.5, 0.1),
@@ -446,3 +455,54 @@ cat("\n\nAll files saved to results/ and results/figures/\n")
 cat("Figures: staged_heatmap, staged_dotci, staged_trend (PDF + PNG)\n")
 cat("Tables:  staged_partial_correlations.csv, stage_trend_test.csv,\n")
 cat("         staged_supplement_pcor.csv, staged_supplement_trend.csv\n")
+
+
+# Do polyols associate with age per se (test in only NCI) ----
+df_hc <- df_complete |> dplyr::filter(fullClass == "NCI")
+df_hc <- df_hc[, c("AgeAtVisit", POLYOL_VARS)]
+
+
+age_eval <- function(metabolite, age) {
+  dat <- df %>%
+    dplyr::select(all_of(c(metabolite, age))) %>%
+    drop_na()
+  
+  f <- as.formula(paste(
+    age, "~", metabolite
+  ))
+  m <- lm(f, data = dat)
+  
+  tidy(m, conf.int = TRUE) %>%
+    dplyr::filter(term == metabolite) %>%
+    dplyr::mutate(metabolite = metabolite) %>%
+    dplyr::select(metabolite, estimate,
+                  conf.low, conf.high, p.value)
+}
+
+age_grid <- lapply(POLYOL_VARS, function(x){age_eval(x, age = "AgeAtVisit")}) |> dplyr::bind_rows()
+
+age_plot <- age_grid |> 
+  dplyr::mutate(
+    met_label   = factor(MET_LABELS[metabolite], levels = rev(MET_LABELS)),
+    stars = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    )
+  ) |> 
+  ggplot(aes(estimate, met_label)) +
+    geom_point(size = 4, pch = 18) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), width = 0.5) +
+    geom_text(
+    aes(label = stars, x = conf.high + 0.2),  # adjust offset as needed
+    vjust = 0.5,
+    size = 5
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Estimate (±95% CI)",
+       y = "Polyol metabolite",
+       title = "Polyol-age associations in NCI group")
+
+ggsave("results/figures/NCI_age_associations.pdf", age_plot, width = 8, height = 5)
