@@ -27,8 +27,9 @@ library(here)
 # =============================================================================
 
 # --- Variable names in your data frame ----------------------------------------
-OUTCOME_VARS  <- c("TAU", "PTAU")          # tau biomarkers (response)
-AMYLOID_VAR   <- "ABETA42"                      # Aβ42 column name
+OUTCOME_VARS  <- c("tTau", "pTau")         # tau biomarkers (response)
+AMYLOID_VAR   <- "Aβ42"                      # Aβ42 column name
+
 COVARIATES    <- c("AgeAtVisit", "Gender", "BMI")      # standard covariate set
 
 # Polyol metabolites selected by Elastic Net (from manuscript Table / Fig 5B)
@@ -45,6 +46,16 @@ POLYOL_VARS <- c(
 # --- Data loading -------------------------------------------------------------
 df <- read.table(here("data/csf_ratios2.csv"), header = T, sep = ";")
 df$Gender <- ifelse(df$Gender == "Female", 1, 2)
+df <- df |> 
+  dplyr::mutate(fullClass = case_when(
+    fullClass == "HC"  ~ "NCI",
+    fullClass == "MCI" ~ "MCI-AD",
+    fullClass == "AD"  ~ "Dementia-AD",
+    fullClass == "VaD" ~ "MIX"
+  )) |> 
+  dplyr::rename("tTau" = TAU,
+                "pTau" = PTAU,
+                "Aβ42" = ABETA42)
 
 # =============================================================================
 # 1. DATA PREPARATION
@@ -340,19 +351,19 @@ plot_euler <- function(vp, outcome) {
 
 # Save Euler plots
 pdf("results/figures/euler_varpart_tTau.pdf", width = 5, height = 5)
-plot_euler(vp_results[["TAU"]], "TAU")
+plot_euler(vp_results[["tTau"]], "tTau")
 dev.off()
 
 pdf("results/figures/euler_varpart_pTau.pdf", width = 5, height = 5)
-plot_euler(vp_results[["PTAU"]], "PTAU")
+plot_euler(vp_results[["pTau"]], "pTau")
 dev.off()
 
 # --- 5b. Stacked bar chart of hierarchical R² ---
 plot_data_hier <- hier_models |>
-  select(outcome, model, R2) |>
+  dplyr::select(outcome, model, R2) |>
   pivot_wider(names_from = model, values_from = R2) |>
   pivot_longer(-outcome, names_to = "model", values_to = "R2") |>
-  mutate(model = factor(model, levels = c(
+  dplyr::mutate(model = factor(model, levels = c(
     "M0: Covariates only",
     "M1: + Aβ42",
     "M2: + Polyols",
@@ -380,8 +391,8 @@ ggsave("results/figures/hierarchical_R2.pdf", p_hier, width = 8, height = 5)
 
 # --- 5c. Partial correlation forest plot ---
 p_pcor <- partial_cor_all |>
-  filter(outcome %in% OUTCOME_VARS) |>
-  mutate(
+  dplyr::filter(outcome %in% OUTCOME_VARS) |>
+  dplyr::mutate(
     metabolite  = factor(metabolite, levels = rev(POLYOL_VARS)),
     adjustment  = factor(adjustment,
                          levels = c("Covariates only", "Aβ42 + Covariates")),
@@ -414,7 +425,7 @@ ggsave("results/figures/partial_cor_forest.pdf", p_pcor, width = 9, height = 5)
 
 # --- 5d. Summary table for supplement -----------------------------------------
 summary_table <- increment_tbl |>
-  mutate(
+  dplyr::mutate(
     across(c(delta_R2, F_stat), ~ round(.x, 3)),
     p_label = ifelse(p_value < 0.001, "< 0.001",
               ifelse(p_value < 0.01,  "< 0.01",
